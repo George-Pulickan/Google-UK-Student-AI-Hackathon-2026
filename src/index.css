@@ -1,1 +1,28 @@
 @import "tailwindcss";
+
+/* Tailwind v4 wires `dark:` to prefers-color-scheme by default, which makes
+   a class-based theme toggle a no-op. Point the variant at the .dark class
+   that App.tsx puts on <html> so the switch actually drives the theme. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+html {
+  color-scheme: light;
+}
+
+html.dark {
+  color-scheme: dark;
+}
+
+/* Native controls (select menus, scrollbars) follow the toggle too. */
+html.dark select option {
+  background-color: #1e293b;
+  color: #e2e8f0;
+}
+
+.scrollbar-none {
+  scrollbar-width: none;
+}
+
+.scrollbar-none::-webkit-scrollbar {
+  display: none;
+}

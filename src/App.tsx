@@ -8,6 +8,7 @@ import {
 } from './types';
 import { getSignTargets } from './data/signsData';
 import { CameraPracticeStudio } from './components/CameraPracticeStudio';
+import { AnySignStudio } from './components/AnySignStudio';
 import { SignDictionary } from './components/SignDictionary';
 import { SignQuizChallenge } from './components/SignQuizChallenge';
 import { MascotCustomizer } from './components/MascotCustomizer';
@@ -22,16 +23,30 @@ import {
   Moon,
   Sun,
   Sparkles,
-  Globe,
+  Wand2,
+  Volume2,
+  VolumeX,
 } from 'lucide-react';
 
+type TabId = 'camera' | 'anysign' | 'dictionary' | 'quiz' | 'customizer' | 'progress';
+
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'camera' | 'dictionary' | 'quiz' | 'customizer' | 'progress'>('camera');
+  const [activeTab, setActiveTab] = useState<TabId>('camera');
   const [signSystem, setSignSystem] = useState<SignLanguageSystem>('ASL');
   const [selectedPracticeSign, setSelectedPracticeSign] = useState<SignTarget>(
     getSignTargets('ASL')[0]
   );
-  const [darkMode, setDarkMode] = useState(false);
+
+  // Theme: remembered across sessions, seeded from the OS preference.
+  const [darkMode, setDarkMode] = useState<boolean>(() => {
+    const saved = localStorage.getItem('signbuddy_dark_mode');
+    if (saved !== null) return saved === 'true';
+    return window.matchMedia?.('(prefers-color-scheme: dark)').matches ?? false;
+  });
+
+  const [voiceEnabled, setVoiceEnabled] = useState<boolean>(
+    () => localStorage.getItem('signbuddy_voice_enabled') !== 'false'
+  );
 
   // Sync practice sign when language changes
   useEffect(() => {
@@ -78,14 +93,16 @@ export default function App() {
     localStorage.setItem('signbuddy_user_progress', JSON.stringify(userProgress));
   }, [userProgress]);
 
-  // Dark Mode Toggle
+  // Drive the `dark` class on <html>; index.css points Tailwind's dark:
+  // variant at that class, and color-scheme keeps native controls in step.
   useEffect(() => {
-    if (darkMode) {
-      document.documentElement.classList.add('dark');
-    } else {
-      document.documentElement.classList.remove('dark');
-    }
+    document.documentElement.classList.toggle('dark', darkMode);
+    localStorage.setItem('signbuddy_dark_mode', String(darkMode));
   }, [darkMode]);
+
+  useEffect(() => {
+    localStorage.setItem('signbuddy_voice_enabled', String(voiceEnabled));
+  }, [voiceEnabled]);
 
   // Handle Evaluation Result
   const handleEvaluationComplete = (sign: SignTarget, result: SignEvaluationResult) => {
@@ -201,9 +218,21 @@ export default function App() {
               </div>
 
               <button
-                onClick={() => setDarkMode(!darkMode)}
+                onClick={() => setVoiceEnabled((v) => !v)}
+                className={`p-2 rounded-xl transition-colors cursor-pointer ${
+                  voiceEnabled
+                    ? 'bg-indigo-100 dark:bg-indigo-950/70 text-indigo-600 dark:text-indigo-300 hover:bg-indigo-200 dark:hover:bg-indigo-900'
+                    : 'bg-slate-100 dark:bg-slate-700 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-600'
+                }`}
+                title={voiceEnabled ? 'Mute the coaching voice' : 'Unmute the coaching voice'}
+              >
+                {voiceEnabled ? <Volume2 className="w-4 h-4" /> : <VolumeX className="w-4 h-4" />}
+              </button>
+
+              <button
+                onClick={() => setDarkMode((v) => !v)}
                 className="p-2 rounded-xl bg-slate-100 dark:bg-slate-700 text-slate-600 dark:text-slate-300 hover:bg-slate-200 dark:hover:bg-slate-600 transition-colors cursor-pointer"
-                title="Toggle theme"
+                title={darkMode ? 'Switch to light mode' : 'Switch to dark mode'}
               >
                 {darkMode ? <Sun className="w-4 h-4" /> : <Moon className="w-4 h-4" />}
               </button>
@@ -215,6 +244,7 @@ export default function App() {
         <div className="max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 flex items-center gap-2 overflow-x-auto py-2.5 border-t border-slate-100 dark:border-slate-700/60">
           {[
             { id: 'camera', label: 'Camera Studio', icon: Camera },
+            { id: 'anysign', label: 'Any Sign', icon: Wand2 },
             { id: 'dictionary', label: `${signSystem} Dictionary`, icon: BookOpen },
             { id: 'quiz', label: 'Quiz Challenge', icon: Trophy },
             { id: 'customizer', label: `Mascot (${mascotConfig.name})`, icon: Palette },
@@ -225,7 +255,7 @@ export default function App() {
             return (
               <button
                 key={tab.id}
-                onClick={() => setActiveTab(tab.id as any)}
+                onClick={() => setActiveTab(tab.id as TabId)}
                 className={`px-4 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 whitespace-nowrap shrink-0 cursor-pointer ${
                   isActive
                     ? 'bg-indigo-600 text-white shadow-md shadow-indigo-200 dark:shadow-none'
@@ -247,7 +277,17 @@ export default function App() {
             initialSign={selectedPracticeSign}
             mascotConfig={mascotConfig}
             signSystem={signSystem}
+            voiceEnabled={voiceEnabled}
+            onToggleVoice={() => setVoiceEnabled((v) => !v)}
             onEvaluationComplete={handleEvaluationComplete}
+          />
+        )}
+
+        {activeTab === 'anysign' && (
+          <AnySignStudio
+            mascotConfig={mascotConfig}
+            signSystem={signSystem}
+            voiceEnabled={voiceEnabled}
           />
         )}
 

@@ -2,7 +2,13 @@ export type ExpressionType = 'HAPPY' | 'CHEERING' | 'THINKING' | 'SHOWING_CORREC
 export type AnimationTriggerType = 'jump_celebrate' | 'demonstrate_sign' | 'idle_confused' | 'dance_happy';
 
 export type SignLanguageSystem = 'ASL' | 'BSL';
-export type CameraMode = 'guided' | 'free_detect' | 'timed_quiz';
+
+/** MediaPipe hand landmark, normalised to the 0-1 image box. */
+export interface HandLandmark {
+  x: number;
+  y: number;
+  z: number;
+}
 
 export interface AvatarReaction {
   expression: ExpressionType;
@@ -17,9 +23,43 @@ export interface SignEvaluationResult {
   detected_gesture?: string;
   misidentified_sign?: string | null;
   positioning_advice?: string;
+  /** Indices (0-20) of hand landmarks Gemini judged to be misplaced. */
+  incorrect_landmarks?: number[];
   target_sign?: string;
   sign_system?: SignLanguageSystem;
   avatar_reaction: AvatarReaction;
+  timestamp?: string;
+}
+
+/* --- "Any Sign" pseudo-A2UI surface --- */
+
+export type A2UIComponentType =
+  | 'heading'
+  | 'text'
+  | 'callout'
+  | 'steps'
+  | 'chips'
+  | 'stat'
+  | 'comparison';
+
+export type A2UITone = 'info' | 'success' | 'warning' | 'danger';
+
+export interface A2UIComponent {
+  type: A2UIComponentType;
+  text?: string;
+  title?: string;
+  label?: string;
+  value?: string;
+  tone?: A2UITone;
+  items?: string[];
+}
+
+export interface AnySignResult {
+  detected_sign: string;
+  confidence: number;
+  spoken_summary: string;
+  components: A2UIComponent[];
+  sign_system?: SignLanguageSystem;
   timestamp?: string;
 }
 
@@ -51,6 +91,10 @@ export interface MascotConfig {
   color: string;
   accessory: MascotAccessory;
   outfit: MascotOutfit;
+  /** Data URL of an AI-generated mascot; when set it replaces the SVG mascot. */
+  generatedImage?: string | null;
+  /** Prebuilt Gemini TTS voice used for this mascot. */
+  voiceName?: string;
 }
 
 export interface UserProgress {

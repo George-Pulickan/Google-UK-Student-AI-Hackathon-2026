@@ -1,0 +1,6 @@
+.env
+node_modules
+dist
+
+# Regenerated from node_modules by scripts/copy-mediapipe-wasm.mjs
+public/wasm

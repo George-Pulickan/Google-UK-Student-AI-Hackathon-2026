@@ -1,4 +1,4 @@
-import React, { useRef, useState, useEffect } from 'react';
+import React, { useRef, useState, useEffect, useCallback } from 'react';
 import confetti from 'canvas-confetti';
 import { motion, AnimatePresence } from 'motion/react';
 import {
@@ -6,11 +6,15 @@ import {
   SignEvaluationResult,
   MascotConfig,
   SignLanguageSystem,
-  CameraMode,
+  HandLandmark,
 } from '../types';
 import { getSignTargets } from '../data/signsData';
 import { SignBuddyMascot } from './SignBuddyMascot';
 import { HandShapeGuide } from './HandShapeGuide';
+import { TargetSignCue } from './TargetSignCue';
+import { useHandLandmarker } from '../lib/useHandLandmarker';
+import { useMascotVoice } from '../lib/useMascotVoice';
+import { drawHandSkeleton, landmarkBounds, landmarkMotion, LANDMARK_LABELS } from '../lib/handSkeleton';
 import {
   Camera,
   RotateCcw,
@@ -20,31 +24,51 @@ import {
   Upload,
   VideoOff,
   ChevronRight,
-  Layers,
-  Compass,
-  Zap,
   AlertTriangle,
   Lightbulb,
+  Volume2,
+  VolumeX,
+  Scan,
+  Hand as HandIcon,
 } from 'lucide-react';
 
 interface CameraPracticeStudioProps {
   initialSign?: SignTarget;
   mascotConfig: MascotConfig;
   signSystem: SignLanguageSystem;
+  voiceEnabled: boolean;
+  onToggleVoice: () => void;
   onEvaluationComplete: (sign: SignTarget, result: SignEvaluationResult) => void;
 }
+
+/**
+ * Alignment target, as a fraction of the video stage. The dashed guide box and
+ * the "is the hand in position" test are both driven from these numbers so
+ * they can never drift apart.
+ */
+const ALIGN_BOX = { x: 0.29, y: 0.11, w: 0.42, h: 0.78 };
+
+/** Mean landmark travel per frame below which the hand counts as held still. */
+const STILL_THRESHOLD = 0.012;
+/** Travel above which an in-flight countdown is abandoned. */
+const BREAK_THRESHOLD = 0.045;
+/** Consecutive still frames required before auto-capture arms. */
+const STILL_FRAMES_REQUIRED = 12;
+/** Quiet period after an evaluation before auto-capture can retrigger. */
+const COOLDOWN_MS = 4000;
 
 export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
   initialSign,
   mascotConfig,
   signSystem,
+  voiceEnabled,
+  onToggleVoice,
   onEvaluationComplete,
 }) => {
   const availableSigns = getSignTargets(signSystem);
   const [currentTarget, setCurrentTarget] = useState<SignTarget>(
     initialSign && initialSign.system === signSystem ? initialSign : availableSigns[0]
   );
-  const [cameraMode, setCameraMode] = useState<CameraMode>('guided');
   const [currentStepIndex, setCurrentStepIndex] = useState(0);
   const [isCameraActive, setIsCameraActive] = useState(false);
   const [cameraError, setCameraError] = useState<string | null>(null);
@@ -53,83 +77,310 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
   const [evaluationResult, setEvaluationResult] = useState<SignEvaluationResult | null>(null);
   const [uploadedImage, setUploadedImage] = useState<string | null>(null);
 
+  // Hand tracking / auto-capture
+  const [autoCapture, setAutoCapture] = useState(true);
+  const [handPresent, setHandPresent] = useState(false);
+  const [handInBox, setHandInBox] = useState(false);
+  const [handSteady, setHandSteady] = useState(false);
+  const [reviewImage, setReviewImage] = useState<string | null>(null);
+
   const videoRef = useRef<HTMLVideoElement | null>(null);
   const canvasRef = useRef<HTMLCanvasElement | null>(null);
+  const overlayRef = useRef<HTMLCanvasElement | null>(null);
+  const stageRef = useRef<HTMLDivElement | null>(null);
 
-  // Sync sign system change
+  const { landmarkerRef, ready: trackingReady, error: trackingError } = useHandLandmarker();
+  const { speak, stop: stopSpeech, speaking } = useMascotVoice(voiceEnabled, mascotConfig.voiceName || 'Leda');
+
+  // rAF-loop scratch state ‚Äî kept in refs so the loop never reads stale props.
+  const rafRef = useRef<number | null>(null);
+  const lastVideoTimeRef = useRef(-1);
+  const liveLandmarksRef = useRef<HandLandmark[] | null>(null);
+  const prevLandmarksRef = useRef<HandLandmark[] | null>(null);
+  const capturedLandmarksRef = useRef<HandLandmark[] | null>(null);
+  const stillFramesRef = useRef(0);
+  const cooldownUntilRef = useRef(0);
+  const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
+
+  const loopStateRef = useRef({
+    autoCapture: true,
+    isEvaluating: false,
+    counting: false,
+    hasUpload: false,
+  });
+  useEffect(() => {
+    loopStateRef.current = {
+      autoCapture,
+      isEvaluating,
+      counting: countdown !== null,
+      hasUpload: uploadedImage !== null,
+    };
+  }, [autoCapture, isEvaluating, countdown, uploadedImage]);
+
+  /* ---------------------------------------------------------------- *
+   * Camera lifecycle
+   * ---------------------------------------------------------------- */
+  // StrictMode mounts effects twice in dev; without this guard the second
+  // getUserMedia aborts the first play() and logs a spurious error.
+  const cameraStartingRef = useRef(false);
+
+  const startCamera = useCallback(async () => {
+    if (cameraStartingRef.current) return;
+    cameraStartingRef.current = true;
+    setCameraError(null);
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
+      });
+      const video = videoRef.current;
+      if (!video) {
+        stream.getTracks().forEach((t) => t.stop());
+        return;
+      }
+      video.srcObject = stream;
+      await video.play().catch(() => {});
+      setIsCameraActive(true);
+    } catch (err: any) {
+      console.warn('Camera access error:', err);
+      setCameraError('Unable to access webcam. You can upload an image or frame below.');
+      setIsCameraActive(false);
+    } finally {
+      cameraStartingRef.current = false;
+    }
+  }, []);
+
+  const stopCamera = useCallback(() => {
+    const stream = videoRef.current?.srcObject as MediaStream | null;
+    stream?.getTracks().forEach((track) => track.stop());
+    if (videoRef.current) videoRef.current.srcObject = null;
+    setIsCameraActive(false);
+  }, []);
+
+  useEffect(() => {
+    startCamera();
+    return () => {
+      stopCamera();
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  /* ---------------------------------------------------------------- *
+   * Sign selection sync
+   * ---------------------------------------------------------------- */
   useEffect(() => {
     const signs = getSignTargets(signSystem);
     if (!signs.find((s) => s.id === currentTarget.id)) {
       setCurrentTarget(signs[0]);
       setCurrentStepIndex(0);
       setEvaluationResult(null);
+      setReviewImage(null);
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [signSystem]);
 
-  // Sync initial sign prop
   useEffect(() => {
     if (initialSign) {
       setCurrentTarget(initialSign);
       setCurrentStepIndex(0);
       setEvaluationResult(null);
+      setReviewImage(null);
     }
   }, [initialSign]);
 
-  // Start / Stop Camera Stream
-  const startCamera = async () => {
-    setCameraError(null);
-    try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
-      });
-      if (videoRef.current) {
-        videoRef.current.srcObject = stream;
-        videoRef.current.play();
-        setIsCameraActive(true);
-      }
-    } catch (err: any) {
-      console.warn('Camera access error:', err);
-      setCameraError('Unable to access webcam. You can upload an image or frame below.');
-      setIsCameraActive(false);
-    }
+  /* ---------------------------------------------------------------- *
+   * Frame geometry
+   * The video is rendered with object-cover, so the visible region is a
+   * centre crop. Landmarks are normalised against the full sensor frame,
+   * so the overlay has to reproduce that same crop to stay registered.
+   * ---------------------------------------------------------------- */
+  const coverTransform = (video: HTMLVideoElement, cw: number, ch: number) => {
+    const scale = Math.max(cw / video.videoWidth, ch / video.videoHeight);
+    const dw = video.videoWidth * scale;
+    const dh = video.videoHeight * scale;
+    return { dw, dh, ox: (cw - dw) / 2, oy: (ch - dh) / 2 };
   };
 
-  const stopCamera = () => {
-    if (videoRef.current && videoRef.current.srcObject) {
-      const stream = videoRef.current.srcObject as MediaStream;
-      stream.getTracks().forEach((track) => track.stop());
-      videoRef.current.srcObject = null;
-    }
-    setIsCameraActive(false);
-  };
-
+  /* ---------------------------------------------------------------- *
+   * Detection + skeleton render loop
+   * ---------------------------------------------------------------- */
   useEffect(() => {
-    startCamera();
-    return () => {
-      stopCamera();
+    if (!trackingReady) return;
+
+    const tick = () => {
+      rafRef.current = requestAnimationFrame(tick);
+
+      const video = videoRef.current;
+      const overlay = overlayRef.current;
+      const landmarker = landmarkerRef.current;
+      const stage = stageRef.current;
+      if (!video || !overlay || !landmarker || !stage) return;
+      if (video.readyState < 2 || !video.videoWidth) return;
+
+      // Keep the overlay bitmap matched to its CSS box.
+      const rect = stage.getBoundingClientRect();
+      const dpr = Math.min(window.devicePixelRatio || 1, 2);
+      const cw = Math.round(rect.width);
+      const ch = Math.round(rect.height);
+      if (overlay.width !== cw * dpr || overlay.height !== ch * dpr) {
+        overlay.width = cw * dpr;
+        overlay.height = ch * dpr;
+      }
+
+      const ctx = overlay.getContext('2d');
+      if (!ctx) return;
+      ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
+      ctx.clearRect(0, 0, cw, ch);
+
+      // Only run inference on genuinely new frames.
+      if (video.currentTime !== lastVideoTimeRef.current) {
+        lastVideoTimeRef.current = video.currentTime;
+        let hand: HandLandmark[] | null = null;
+        try {
+          const result = landmarker.detectForVideo(video, performance.now());
+          hand = (result.landmarks?.[0] as HandLandmark[]) ?? null;
+        } catch {
+          hand = null;
+        }
+
+        prevLandmarksRef.current = liveLandmarksRef.current;
+        liveLandmarksRef.current = hand;
+
+        if (hand) {
+          const travel = landmarkMotion(prevLandmarksRef.current, hand);
+          if (travel < STILL_THRESHOLD) stillFramesRef.current += 1;
+          else stillFramesRef.current = 0;
+
+          // Abort a running countdown if the hand bolts.
+          if (loopStateRef.current.counting && travel > BREAK_THRESHOLD) {
+            abortCountdown();
+          }
+        } else {
+          stillFramesRef.current = 0;
+          if (loopStateRef.current.counting) abortCountdown();
+        }
+      }
+
+      const hand = liveLandmarksRef.current;
+      const { dw, dh, ox, oy } = coverTransform(video, cw, ch);
+
+      let inBox = false;
+      if (hand) {
+        const bounds = landmarkBounds(hand);
+        // Mirror to display space, then map through the cover crop.
+        const displayX = (ox + (1 - bounds.centerX) * dw) / cw;
+        const displayY = (oy + bounds.centerY * dh) / ch;
+        inBox =
+          displayX > ALIGN_BOX.x &&
+          displayX < ALIGN_BOX.x + ALIGN_BOX.w &&
+          displayY > ALIGN_BOX.y &&
+          displayY < ALIGN_BOX.y + ALIGN_BOX.h;
+
+        ctx.save();
+        ctx.translate(ox, oy);
+        drawHandSkeleton(ctx, hand, dw, dh, {
+          mirrored: true,
+          scale: Math.max(0.75, cw / 640),
+          opacity: loopStateRef.current.counting ? 0.95 : 0.85,
+        });
+        ctx.restore();
+      }
+
+      const steady = !!hand && stillFramesRef.current >= STILL_FRAMES_REQUIRED;
+      setHandPresent((v) => (v !== !!hand ? !!hand : v));
+      setHandInBox((v) => (v !== inBox ? inBox : v));
+      setHandSteady((v) => (v !== steady ? steady : v));
+
+      // Arm the auto-capture countdown.
+      const s = loopStateRef.current;
+      if (
+        s.autoCapture &&
+        !s.isEvaluating &&
+        !s.counting &&
+        !s.hasUpload &&
+        hand &&
+        inBox &&
+        steady &&
+        performance.now() > cooldownUntilRef.current
+      ) {
+        beginCountdown();
+      }
     };
+
+    rafRef.current = requestAnimationFrame(tick);
+    return () => {
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [trackingReady]);
+
+  /* ---------------------------------------------------------------- *
+   * Countdown
+   * ---------------------------------------------------------------- */
+  const abortCountdown = useCallback(() => {
+    if (countdownTimerRef.current) {
+      clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+    }
+    setCountdown(null);
+    stillFramesRef.current = 0;
   }, []);
 
-  // Countdown handle
-  const triggerCountdownAndCapture = () => {
-    if (countdown !== null || isEvaluating) return;
-
+  const beginCountdown = useCallback(() => {
+    if (countdownTimerRef.current) return;
     setCountdown(3);
-    const timer = setInterval(() => {
+    countdownTimerRef.current = setInterval(() => {
       setCountdown((prev) => {
-        if (prev === 1) {
-          clearInterval(timer);
+        if (prev === null) return null;
+        if (prev <= 1) {
+          if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+          countdownTimerRef.current = null;
           captureAndEvaluate();
           return null;
         }
-        return prev ? prev - 1 : null;
+        return prev - 1;
       });
     }, 1000);
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
-  // Capture frame & send to Gemini backend
-  const captureAndEvaluate = async () => {
+  /* ---------------------------------------------------------------- *
+   * Capture, evaluate, annotate
+   * ---------------------------------------------------------------- */
+
+  /** Paints the captured still with the skeleton, flagged joints in red. */
+  const buildReviewImage = useCallback(
+    (source: HTMLCanvasElement | HTMLImageElement, landmarks: HandLandmark[] | null, wrong: number[]) => {
+      if (!landmarks?.length) return null;
+      const w = 'videoWidth' in source ? (source as any).videoWidth : source.width;
+      const h = 'videoHeight' in source ? (source as any).videoHeight : source.height;
+      const out = document.createElement('canvas');
+      out.width = w;
+      out.height = h;
+      const ctx = out.getContext('2d');
+      if (!ctx) return null;
+
+      ctx.drawImage(source as CanvasImageSource, 0, 0, w, h);
+      // Darken slightly so the armature reads against a bright room.
+      ctx.fillStyle = 'rgba(2, 6, 23, 0.35)';
+      ctx.fillRect(0, 0, w, h);
+
+      drawHandSkeleton(ctx, landmarks, w, h, {
+        mirrored: false,
+        wrong,
+        markCorrect: true,
+        scale: Math.max(1, w / 640),
+      });
+      return out.toDataURL('image/jpeg', 0.9);
+    },
+    []
+  );
+
+  const captureAndEvaluate = useCallback(async () => {
     let imageBase64: string | null = null;
+    let sourceCanvas: HTMLCanvasElement | null = null;
+    const landmarks = liveLandmarksRef.current ? [...liveLandmarksRef.current] : null;
 
     if (uploadedImage) {
       imageBase64 = uploadedImage;
@@ -140,40 +391,51 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
       canvas.height = video.videoHeight || 480;
       const ctx = canvas.getContext('2d');
       if (ctx) {
+        // True (un-mirrored) sensor frame, so handedness reaches Gemini intact.
         ctx.drawImage(video, 0, 0, canvas.width, canvas.height);
         imageBase64 = canvas.toDataURL('image/jpeg', 0.85);
+        sourceCanvas = canvas;
       }
     }
 
     if (!imageBase64) {
-      alert('Please activate camera or upload an image frame first!');
+      setCameraError('Turn on the camera or upload an image frame first.');
       return;
     }
 
+    capturedLandmarksRef.current = landmarks;
     setIsEvaluating(true);
     setEvaluationResult(null);
+    setReviewImage(null);
+    stopSpeech();
 
     try {
       const response = await fetch('/api/evaluate-sign', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
         body: JSON.stringify({
-          imageBase64: imageBase64,
+          imageBase64,
           targetSign: currentTarget,
           mascotName: mascotConfig.name,
-          signSystem: signSystem,
+          signSystem,
+          landmarks,
         }),
       });
 
-      if (!response.ok) {
-        throw new Error(`Evaluation server error: ${response.statusText}`);
-      }
+      if (!response.ok) throw new Error(`Evaluation server error: ${response.statusText}`);
 
       const data: SignEvaluationResult = await response.json();
       setEvaluationResult(data);
 
+      if (sourceCanvas && landmarks) {
+        setReviewImage(buildReviewImage(sourceCanvas, landmarks, data.incorrect_landmarks ?? []));
+      }
+
+      if (data.avatar_reaction?.dialogue_bubble) {
+        speak(data.avatar_reaction.dialogue_bubble, data.avatar_reaction.expression);
+      }
+
       if (data.is_correct) {
-        // Confetti celebration
         confetti({
           particleCount: 80,
           spread: 70,
@@ -181,34 +443,34 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
           colors: ['#6366F1', '#EC4899', '#10B981', '#F59E0B'],
         });
 
-        // Advance to next instruction step with animation if available
         if (currentTarget.steps && currentStepIndex < currentTarget.steps.length - 1) {
-          setTimeout(() => {
-            setCurrentStepIndex((prev) => prev + 1);
-          }, 800);
+          setTimeout(() => setCurrentStepIndex((prev) => prev + 1), 800);
         }
       }
 
       onEvaluationComplete(currentTarget, data);
     } catch (err: any) {
       console.error('Error evaluating sign:', err);
-      const fallbackResult: SignEvaluationResult = {
+      setEvaluationResult({
         is_correct: false,
         accuracy_score: 55,
         feedback_tip: 'Make sure your hand is in clear focus with good lighting!',
         detected_gesture: 'Unrecognized gesture',
         positioning_advice: 'Hold your hand steadily in the center frame.',
+        incorrect_landmarks: [],
         avatar_reaction: {
           expression: 'CONFUSED',
           animation_trigger: 'idle_confused',
           dialogue_bubble: `Oops! Let's try again. Position your hand right in front of the camera!`,
         },
-      };
-      setEvaluationResult(fallbackResult);
+      });
     } finally {
       setIsEvaluating(false);
+      stillFramesRef.current = 0;
+      cooldownUntilRef.current = performance.now() + COOLDOWN_MS;
     }
-  };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [uploadedImage, isCameraActive, currentTarget, mascotConfig.name, signSystem, currentStepIndex]);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -217,20 +479,46 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
       reader.onloadend = () => {
         setUploadedImage(reader.result as string);
         setEvaluationResult(null);
+        setReviewImage(null);
       };
       reader.readAsDataURL(file);
     }
   };
 
+  const jumpToLetter = (letter: string) => {
+    const id = signSystem === 'BSL' ? `BSL_${letter}` : letter;
+    const found = availableSigns.find((s) => s.id === id);
+    if (found) {
+      setCurrentTarget(found);
+      setCurrentStepIndex(0);
+      setEvaluationResult(null);
+      setReviewImage(null);
+    }
+  };
+
   const stepsList = currentTarget.steps || [currentTarget.description];
+  const wrongJoints = evaluationResult?.incorrect_landmarks ?? [];
+
+  // Human-readable summary of which joints Gemini flagged.
+  const wrongJointNames = Array.from(new Set(wrongJoints.map((i) => LANDMARK_LABELS[i]).filter(Boolean)));
+
+  const trackingStatus = !trackingReady
+    ? { label: 'Loading hand model‚Ä¶', tone: 'bg-slate-500' }
+    : !handPresent
+    ? { label: 'No hand detected', tone: 'bg-slate-500' }
+    : !handInBox
+    ? { label: 'Move hand into the box', tone: 'bg-amber-500' }
+    : !handSteady
+    ? { label: 'Hold still‚Ä¶', tone: 'bg-sky-500' }
+    : { label: 'Locked on', tone: 'bg-emerald-500' };
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">
       <canvas ref={canvasRef} className="hidden" />
 
-      {/* Left Column: Top Instructions, Mode Select, Camera Preview & Quick Controls */}
+      {/* Left column */}
       <div className="lg:col-span-8 flex flex-col gap-5">
-        {/* 1. TOP STEP-BY-STEP INSTRUCTION BANNER (Positioned above Camera) */}
+        {/* Step-by-step instructions */}
         <div className="bg-white dark:bg-slate-800 rounded-3xl border border-slate-200 dark:border-slate-700 p-5 shadow-sm space-y-3">
           <div className="flex flex-wrap items-center justify-between gap-3 pb-2 border-b border-slate-100 dark:border-slate-700/60">
             <div className="flex items-center gap-2">
@@ -247,7 +535,6 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
               </div>
             </div>
 
-            {/* Target Select Dropdown */}
             <select
               value={currentTarget.id}
               onChange={(e) => {
@@ -256,9 +543,10 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
                   setCurrentTarget(found);
                   setCurrentStepIndex(0);
                   setEvaluationResult(null);
+                  setReviewImage(null);
                 }
               }}
-              className="px-3 py-1.5 bg-slate-100 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-xl text-xs font-bold text-slate-800 dark:text-slate-200 focus:outline-none focus:border-indigo-500"
+              className="px-3 py-1.5 bg-slate-100 dark:bg-slate-700 border border-slate-200 dark:border-slate-600 rounded-xl text-xs font-bold text-slate-800 dark:text-slate-200 focus:outline-none focus:border-indigo-500 cursor-pointer"
             >
               {availableSigns.map((sign) => (
                 <option key={sign.id} value={sign.id}>
@@ -268,21 +556,20 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
             </select>
           </div>
 
-          {/* Animated Step Progress Pills */}
           <div className="flex items-center gap-2 overflow-x-auto pb-1 scrollbar-none">
-            {stepsList.map((stepText, idx) => {
+            {stepsList.map((_, idx) => {
               const isCurrent = currentStepIndex === idx;
               const isPast = currentStepIndex > idx;
               return (
                 <button
                   key={idx}
                   onClick={() => setCurrentStepIndex(idx)}
-                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shrink-0 ${
+                  className={`px-3 py-1.5 rounded-xl text-xs font-bold transition-all flex items-center gap-1.5 shrink-0 cursor-pointer ${
                     isCurrent
-                      ? 'bg-indigo-600 text-white shadow-md ring-2 ring-indigo-400 ring-offset-1'
+                      ? 'bg-indigo-600 text-white shadow-md ring-2 ring-indigo-400 ring-offset-1 dark:ring-offset-slate-800'
                       : isPast
                       ? 'bg-emerald-100 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300'
-                      : 'bg-slate-100 dark:bg-slate-700/60 text-slate-500 dark:text-slate-400 hover:bg-slate-200'
+                      : 'bg-slate-100 dark:bg-slate-700/60 text-slate-500 dark:text-slate-400 hover:bg-slate-200 dark:hover:bg-slate-700'
                   }`}
                 >
                   <span className="text-[10px] uppercase font-black">Step {idx + 1}</span>
@@ -292,7 +579,6 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
             })}
           </div>
 
-          {/* Active Animated Step Card */}
           <div className="relative min-h-[50px] bg-slate-50 dark:bg-slate-900/60 p-4 rounded-2xl border border-slate-200/80 dark:border-slate-700 overflow-hidden">
             <AnimatePresence mode="wait">
               <motion.div
@@ -315,7 +601,7 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
                 {currentStepIndex < stepsList.length - 1 && (
                   <button
                     onClick={() => setCurrentStepIndex((prev) => prev + 1)}
-                    className="p-2 rounded-xl bg-indigo-50 dark:bg-slate-800 text-indigo-600 dark:text-indigo-300 hover:bg-indigo-100 transition-colors text-xs font-bold shrink-0 flex items-center gap-1"
+                    className="p-2 rounded-xl bg-indigo-50 dark:bg-slate-800 text-indigo-600 dark:text-indigo-300 hover:bg-indigo-100 dark:hover:bg-slate-700 transition-colors text-xs font-bold shrink-0 flex items-center gap-1 cursor-pointer"
                   >
                     <span>Next Step</span>
                     <ChevronRight className="w-4 h-4" />
@@ -326,41 +612,51 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
           </div>
         </div>
 
-        {/* 2. TOP ACTION CONTROL BAR (Moved higher for instant snapping!) */}
+        {/* Action bar */}
         <div className="bg-white dark:bg-slate-800 p-4 rounded-2xl border border-slate-200 dark:border-slate-700 shadow-sm flex flex-wrap items-center justify-between gap-3">
-          {/* Camera Mode Toggle Buttons */}
-          <div className="flex items-center gap-1.5 bg-slate-100 dark:bg-slate-900 p-1 rounded-xl">
-            {[
-              { id: 'guided', label: 'Guided Practice', icon: Compass },
-              { id: 'free_detect', label: 'Free Sign ID', icon: Layers },
-              { id: 'timed_quiz', label: 'Timed Snap', icon: Zap },
-            ].map((mode) => {
-              const Icon = mode.icon;
-              const isActive = cameraMode === mode.id;
-              return (
-                <button
-                  key={mode.id}
-                  onClick={() => setCameraMode(mode.id as CameraMode)}
-                  className={`px-3 py-1.5 rounded-lg text-xs font-bold transition-all flex items-center gap-1.5 ${
-                    isActive
-                      ? 'bg-white dark:bg-slate-800 text-indigo-600 dark:text-indigo-400 shadow-xs'
-                      : 'text-slate-500 dark:text-slate-400 hover:text-slate-800 dark:hover:text-slate-200'
-                  }`}
-                >
-                  <Icon className="w-3.5 h-3.5" />
-                  <span className="hidden sm:inline">{mode.label}</span>
-                </button>
-              );
-            })}
+          <div className="flex items-center gap-2">
+            {/* Auto-detect toggle */}
+            <button
+              onClick={() => {
+                setAutoCapture((v) => !v);
+                abortCountdown();
+              }}
+              className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 cursor-pointer border ${
+                autoCapture
+                  ? 'bg-emerald-50 dark:bg-emerald-950/60 text-emerald-700 dark:text-emerald-300 border-emerald-300 dark:border-emerald-800'
+                  : 'bg-slate-100 dark:bg-slate-900 text-slate-500 dark:text-slate-400 border-slate-200 dark:border-slate-700'
+              }`}
+              title="Automatically re-analyse when your hand settles in the box"
+            >
+              <Scan className={`w-4 h-4 ${autoCapture ? 'animate-pulse' : ''}`} />
+              <span className="hidden sm:inline">Auto-Detect {autoCapture ? 'On' : 'Off'}</span>
+            </button>
+
+            {/* Voice toggle */}
+            <button
+              onClick={onToggleVoice}
+              className={`px-3.5 py-2 rounded-xl text-xs font-bold transition-all flex items-center gap-2 cursor-pointer border ${
+                voiceEnabled
+                  ? 'bg-indigo-50 dark:bg-indigo-950/60 text-indigo-700 dark:text-indigo-300 border-indigo-300 dark:border-indigo-800'
+                  : 'bg-slate-100 dark:bg-slate-900 text-slate-500 dark:text-slate-400 border-slate-200 dark:border-slate-700'
+              }`}
+              title="Gemini text-to-speech coaching voice"
+            >
+              {voiceEnabled ? (
+                <Volume2 className={`w-4 h-4 ${speaking ? 'animate-pulse' : ''}`} />
+              ) : (
+                <VolumeX className="w-4 h-4" />
+              )}
+              <span className="hidden sm:inline">Voice {voiceEnabled ? 'On' : 'Off'}</span>
+            </button>
           </div>
 
-          {/* Primary Quick Capture Buttons */}
           <div className="flex items-center gap-2">
             <button
-              onClick={triggerCountdownAndCapture}
+              onClick={beginCountdown}
               disabled={isEvaluating || countdown !== null}
-              className="px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl font-bold text-xs shadow-sm transition-all flex items-center gap-1.5 disabled:opacity-50"
-              title="3 Second Timer Snap"
+              className="px-4 py-2.5 bg-amber-500 hover:bg-amber-600 text-white rounded-xl font-bold text-xs shadow-sm transition-all flex items-center gap-1.5 disabled:opacity-50 cursor-pointer"
+              title="3 second timer snap"
             >
               <Sparkles className="w-4 h-4" />
               <span>3s Timer</span>
@@ -369,72 +665,98 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
             <button
               onClick={captureAndEvaluate}
               disabled={isEvaluating || countdown !== null}
-              className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-black text-xs shadow-md shadow-indigo-200 dark:shadow-none transition-all flex items-center gap-2 disabled:opacity-50 hover:scale-102 cursor-pointer"
+              className="px-5 py-2.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded-xl font-black text-xs shadow-md shadow-indigo-200 dark:shadow-none transition-all flex items-center gap-2 disabled:opacity-50 cursor-pointer"
             >
               <Camera className="w-4 h-4" />
               <span>{isEvaluating ? 'Analyzing...' : 'Take Picture & Check'}</span>
             </button>
 
-            <label className="p-2.5 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 rounded-xl font-bold cursor-pointer transition-colors" title="Upload Image Frame">
+            <label
+              className="p-2.5 bg-slate-100 dark:bg-slate-700 hover:bg-slate-200 dark:hover:bg-slate-600 text-slate-700 dark:text-slate-200 rounded-xl font-bold cursor-pointer transition-colors"
+              title="Upload image frame"
+            >
               <Upload className="w-4 h-4" />
-              <input
-                type="file"
-                accept="image/*"
-                onChange={handleFileUpload}
-                className="hidden"
-              />
+              <input type="file" accept="image/*" onChange={handleFileUpload} className="hidden" />
             </label>
           </div>
         </div>
 
-        {/* 3. VIDEO CAMERA DISPLAY CONTAINER */}
-        <div className="relative aspect-4/3 w-full bg-slate-900 rounded-3xl border-4 border-white dark:border-slate-800 shadow-2xl overflow-hidden group flex items-center justify-center">
-          <div className="absolute inset-0 bg-[radial-gradient(circle_at_center,_var(--tw-gradient-stops))] from-slate-800/50 to-transparent pointer-events-none" />
-
-          {/* Live Analysis Badge */}
-          <div className="absolute top-5 left-5 px-3.5 py-1.5 bg-black/40 backdrop-blur-md rounded-full border border-white/20 flex items-center gap-2 pointer-events-none z-10">
+        {/* Video stage */}
+        <div
+          ref={stageRef}
+          className="relative aspect-4/3 w-full bg-slate-900 rounded-3xl border-4 border-white dark:border-slate-800 shadow-2xl overflow-hidden flex items-center justify-center"
+        >
+          {/* Live badge */}
+          <div className="absolute top-5 left-5 px-3.5 py-1.5 bg-black/40 backdrop-blur-md rounded-full border border-white/20 flex items-center gap-2 pointer-events-none z-20">
             <div className={`w-2 h-2 rounded-full ${isCameraActive ? 'bg-red-500 animate-pulse' : 'bg-slate-400'}`} />
             <span className="text-white text-[10px] font-extrabold tracking-widest uppercase">
               {isCameraActive ? 'LIVE CAMERA' : 'FRAME MODE'}
             </span>
           </div>
 
-          {/* Mode Pill Badge Overlay */}
-          <div className="absolute top-5 right-5 px-3 py-1 bg-indigo-950/80 backdrop-blur-md rounded-full border border-indigo-500/30 text-indigo-200 text-[10px] font-black uppercase tracking-wider z-10">
-            {cameraMode === 'guided' ? 'Ì†ºÌæØ Guided' : cameraMode === 'free_detect' ? 'üîç Free Detect' : '‚è±Ô∏è Timed'}
+          {/* Tracking status */}
+          <div className="absolute top-5 right-5 px-3 py-1.5 bg-black/50 backdrop-blur-md rounded-full border border-white/20 flex items-center gap-2 pointer-events-none z-20">
+            <span className={`w-2 h-2 rounded-full ${trackingStatus.tone}`} />
+            <span className="text-white text-[10px] font-black uppercase tracking-wider">
+              {trackingStatus.label}
+            </span>
           </div>
 
-          {/* Alignment Frame Overlay */}
-          <div className="absolute inset-0 flex items-center justify-center pointer-events-none z-10">
-            <div className="w-56 h-72 sm:w-64 sm:h-80 border-2 border-dashed border-indigo-400/50 rounded-2xl flex items-center justify-center bg-indigo-500/5">
-              <div className="text-indigo-300 text-[10px] font-extrabold uppercase tracking-widest bg-slate-900/90 px-3 py-1 rounded-full border border-indigo-400/30">
-                Align hand here
-              </div>
-            </div>
-          </div>
-
-          {/* Active Webcam Feed */}
+          {/* Webcam feed */}
           <video
             ref={videoRef}
             playsInline
             muted
-            className={`w-full h-full object-cover transform -scale-x-100 ${
-              isCameraActive && !uploadedImage ? 'block' : 'hidden'
+            className={`absolute inset-0 w-full h-full object-cover transform -scale-x-100 transition-[filter] duration-300 ${
+              countdown !== null ? 'grayscale brightness-50' : ''
+            } ${isCameraActive && !uploadedImage ? 'block' : 'hidden'}`}
+          />
+
+          {/* Uploaded frame */}
+          {uploadedImage && (
+            <img src={uploadedImage} alt="Uploaded hand sign" className="absolute inset-0 w-full h-full object-contain" />
+          )}
+
+          {/* Skeleton overlay */}
+          <canvas
+            ref={overlayRef}
+            className={`absolute inset-0 w-full h-full pointer-events-none z-10 ${
+              uploadedImage ? 'hidden' : 'block'
             }`}
           />
 
-          {/* Uploaded Image Preview */}
-          {uploadedImage && (
-            <img
-              src={uploadedImage}
-              alt="Uploaded hand sign"
-              className="w-full h-full object-contain"
-            />
-          )}
+          {/* Alignment box ‚Äî geometry shared with the in-box test */}
+          <div
+            className="absolute pointer-events-none z-10 transition-all duration-300"
+            style={{
+              left: `${ALIGN_BOX.x * 100}%`,
+              top: `${ALIGN_BOX.y * 100}%`,
+              width: `${ALIGN_BOX.w * 100}%`,
+              height: `${ALIGN_BOX.h * 100}%`,
+            }}
+          >
+            <div
+              className={`w-full h-full rounded-2xl border-2 border-dashed flex items-start justify-center pt-2 transition-colors duration-300 ${
+                countdown !== null
+                  ? 'border-white/70 bg-white/10'
+                  : handSteady && handInBox
+                  ? 'border-emerald-400/80 bg-emerald-500/10'
+                  : handInBox
+                  ? 'border-sky-400/70 bg-sky-500/10'
+                  : 'border-indigo-400/50 bg-indigo-500/5'
+              }`}
+            >
+              {countdown === null && (
+                <div className="text-indigo-100 text-[10px] font-extrabold uppercase tracking-widest bg-slate-900/80 px-3 py-1 rounded-full border border-indigo-400/30">
+                  {handInBox ? (handSteady ? 'Hold it!' : 'Steady‚Ä¶') : 'Align hand here'}
+                </div>
+              )}
+            </div>
+          </div>
 
-          {/* Camera Error / Placeholder */}
+          {/* Camera off placeholder */}
           {!isCameraActive && !uploadedImage && (
-            <div className="text-center p-6 text-slate-400 z-10">
+            <div className="text-center p-6 text-slate-400 z-20">
               <VideoOff className="w-12 h-12 mx-auto mb-3 opacity-40" />
               <p className="text-sm font-bold mb-1">Webcam Inactive</p>
               <p className="text-xs max-w-xs mx-auto mb-4">
@@ -442,28 +764,56 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
               </p>
               <button
                 onClick={startCamera}
-                className="px-4 py-2 bg-indigo-600 text-white rounded-xl text-xs font-bold shadow-md hover:bg-indigo-700 transition-colors"
+                className="px-4 py-2 bg-indigo-600 text-white rounded-xl text-xs font-bold shadow-md hover:bg-indigo-700 transition-colors cursor-pointer"
               >
                 Turn On Camera
               </button>
             </div>
           )}
 
-          {/* Countdown Overlay */}
-          {countdown !== null && (
-            <div className="absolute inset-0 bg-slate-950/60 backdrop-blur-xs flex items-center justify-center z-30">
-              <span className="text-8xl font-black text-white animate-ping">
-                {countdown}
-              </span>
+          {/* 3-2-1 grey-out */}
+          <AnimatePresence>
+            {countdown !== null && (
+              <motion.div
+                initial={{ opacity: 0 }}
+                animate={{ opacity: 1 }}
+                exit={{ opacity: 0 }}
+                className="absolute inset-0 bg-slate-950/55 backdrop-blur-[2px] flex flex-col items-center justify-center z-30 pointer-events-none"
+              >
+                <AnimatePresence mode="wait">
+                  <motion.div
+                    key={countdown}
+                    initial={{ scale: 0.4, opacity: 0 }}
+                    animate={{ scale: 1, opacity: 1 }}
+                    exit={{ scale: 1.7, opacity: 0 }}
+                    transition={{ duration: 0.42, ease: 'easeOut' }}
+                    className="relative flex items-center justify-center"
+                  >
+                    <div className="absolute w-40 h-40 rounded-full border-4 border-white/25" />
+                    <span className="text-8xl font-black text-white drop-shadow-[0_4px_20px_rgba(0,0,0,0.6)] tabular-nums">
+                      {countdown}
+                    </span>
+                  </motion.div>
+                </AnimatePresence>
+                <p className="mt-6 text-white/80 text-xs font-black uppercase tracking-[0.25em]">
+                  Hold your sign
+                </p>
+              </motion.div>
+            )}
+          </AnimatePresence>
+
+          {/* Analyzing shimmer */}
+          {isEvaluating && (
+            <div className="absolute inset-0 bg-indigo-950/45 backdrop-blur-[1px] flex flex-col items-center justify-center z-30 pointer-events-none">
+              <div className="w-10 h-10 border-3 border-white/25 border-t-white rounded-full animate-spin" />
+              <p className="mt-4 text-white text-xs font-black uppercase tracking-[0.25em]">Analyzing‚Ä¶</p>
             </div>
           )}
 
-          {/* Floating Bottom Status Overlay */}
-          <div className="absolute bottom-5 left-1/2 -translate-x-1/2 flex flex-wrap items-center justify-center gap-3 z-10 w-full px-4">
+          {/* Bottom status */}
+          <div className="absolute bottom-5 left-1/2 -translate-x-1/2 flex flex-wrap items-center justify-center gap-3 z-20 w-full px-4">
             <div className="px-4 py-2 bg-black/60 backdrop-blur-md rounded-2xl border border-white/20 text-center shadow-lg">
-              <div className="text-white/60 text-[9px] font-extrabold uppercase mb-0.5 tracking-wider">
-                Detected
-              </div>
+              <div className="text-white/60 text-[9px] font-extrabold uppercase mb-0.5 tracking-wider">Detected</div>
               <div className="text-white font-mono text-xs font-bold tracking-wider">
                 {evaluationResult?.detected_gesture
                   ? `[${evaluationResult.detected_gesture.toUpperCase()}]`
@@ -472,40 +822,43 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
             </div>
 
             <div className="px-4 py-2 bg-indigo-600 rounded-2xl shadow-xl text-center border border-indigo-400/30 text-white">
-              <div className="text-white/70 text-[9px] font-extrabold uppercase mb-0.5 tracking-wider">
-                Target Sign
-              </div>
+              <div className="text-white/70 text-[9px] font-extrabold uppercase mb-0.5 tracking-wider">Target Sign</div>
               <div className="text-white font-bold text-xs">{currentTarget.label}</div>
             </div>
           </div>
 
-          {/* Clear Uploaded Image Button */}
+          {/* Reset upload */}
           {uploadedImage && (
             <button
               onClick={() => {
                 setUploadedImage(null);
                 startCamera();
               }}
-              className="absolute top-5 right-5 bg-slate-900/80 hover:bg-slate-900 text-white p-2 rounded-full backdrop-blur-md shadow-md text-xs font-bold z-20"
+              className="absolute top-16 right-5 bg-slate-900/80 hover:bg-slate-900 text-white p-2 rounded-full backdrop-blur-md shadow-md z-30 cursor-pointer"
               title="Return to webcam"
             >
               <RotateCcw className="w-4 h-4" />
             </button>
           )}
         </div>
+
+        {trackingError && (
+          <div className="text-[11px] font-semibold text-amber-700 dark:text-amber-300 bg-amber-50 dark:bg-amber-950/50 border border-amber-200 dark:border-amber-800 rounded-xl px-3 py-2">
+            Hand tracking unavailable ({trackingError}). Manual capture still works.
+          </div>
+        )}
       </div>
 
-      {/* Right Column: SignBuddy Mascot Stage, Target Hand Shape Guide & Diagnostic Results */}
+      {/* Right column */}
       <div className="lg:col-span-4 flex flex-col gap-6">
-        {/* 1. SignBuddy Mascot Stage */}
+        {/* Mascot stage */}
         <div className="bg-indigo-500 dark:bg-indigo-900 rounded-3xl p-6 flex flex-col items-center justify-center relative overflow-hidden shadow-xl shadow-indigo-100 dark:shadow-none min-h-[280px]">
           <div className="absolute -top-12 -right-12 w-48 h-48 bg-indigo-400/40 rounded-full pointer-events-none" />
           <div className="relative z-10 w-full flex flex-col items-center">
             <SignBuddyMascot
               config={mascotConfig}
               expression={
-                evaluationResult?.avatar_reaction?.expression ||
-                (isEvaluating ? 'THINKING' : 'HAPPY')
+                evaluationResult?.avatar_reaction?.expression || (isEvaluating ? 'THINKING' : 'HAPPY')
               }
               animationTrigger={
                 evaluationResult?.avatar_reaction?.animation_trigger ||
@@ -515,25 +868,92 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
                 evaluationResult?.avatar_reaction?.dialogue_bubble ||
                 (isEvaluating
                   ? `Hold steady! Analyzing your gesture for "${currentTarget.label}"...`
-                  : `Hi! Align your hand and tap "Take Picture & Check"!`)
+                  : `Hi! Align your hand in the box ‚Äî I'll snap it automatically!`)
               }
               isEvaluating={isEvaluating}
+              isSpeaking={speaking}
               size="lg"
             />
           </div>
         </div>
 
-        {/* 2. TARGET HAND SHAPE DIAGRAM GUIDE (Positioned directly under Mascot!) */}
-        <HandShapeGuide target={currentTarget} />
+        {/* What to sign ‚Äî avatar cue */}
+        <TargetSignCue
+          target={currentTarget}
+          mascotConfig={mascotConfig}
+          isEvaluating={isEvaluating}
+          result={evaluationResult}
+          onReplayVoice={() =>
+            speak(
+              evaluationResult?.avatar_reaction?.dialogue_bubble ||
+                `Let's sign ${currentTarget.label}. ${currentTarget.handShapeDescription}`,
+              evaluationResult?.avatar_reaction?.expression || 'SHOWING_CORRECT_SIGN'
+            )
+          }
+          voiceEnabled={voiceEnabled}
+          speaking={speaking}
+        />
 
-        {/* 3. DIAGNOSTIC EVALUATION & POSITIONING ADVICE PANEL */}
+        {/* Reference handshape */}
+        <HandShapeGuide target={currentTarget} onPickLetter={jumpToLetter} />
+
+        {/* Skeleton diagnostic */}
+        {reviewImage && (
+          <motion.div
+            initial={{ opacity: 0, y: 12 }}
+            animate={{ opacity: 1, y: 0 }}
+            className="bg-white dark:bg-slate-800 rounded-3xl border border-slate-200 dark:border-slate-700 p-5 shadow-sm space-y-3"
+          >
+            <div className="flex items-center gap-2">
+              <div className="w-8 h-8 rounded-lg bg-rose-50 dark:bg-rose-950/60 text-rose-600 dark:text-rose-400 flex items-center justify-center">
+                <HandIcon className="w-4 h-4" />
+              </div>
+              <div>
+                <h4 className="text-[10px] font-bold uppercase tracking-widest text-slate-400 dark:text-slate-500">
+                  Skeleton Diagnostic
+                </h4>
+                <p className="text-sm font-black text-slate-900 dark:text-slate-100">
+                  {wrongJoints.length === 0 ? 'Every joint on target' : `${wrongJoints.length} joints to fix`}
+                </p>
+              </div>
+            </div>
+
+            <img
+              src={reviewImage}
+              alt="Your hand with the tracked skeleton overlaid"
+              className="w-full rounded-2xl border border-slate-200 dark:border-slate-700"
+            />
+
+            <div className="flex items-center gap-4 text-[10px] font-bold">
+              <span className="flex items-center gap-1.5 text-emerald-600 dark:text-emerald-400">
+                <span className="w-2.5 h-2.5 rounded-full bg-emerald-500" /> Correct
+              </span>
+              <span className="flex items-center gap-1.5 text-rose-600 dark:text-rose-400">
+                <span className="w-2.5 h-2.5 rounded-full bg-rose-500" /> Needs fixing
+              </span>
+            </div>
+
+            {wrongJointNames.length > 0 && (
+              <div className="flex flex-wrap gap-1.5">
+                {wrongJointNames.map((name) => (
+                  <span
+                    key={name}
+                    className="px-2 py-0.5 rounded-full bg-rose-50 dark:bg-rose-950/60 text-rose-700 dark:text-rose-300 border border-rose-200 dark:border-rose-900 text-[10px] font-bold"
+                  >
+                    {name}
+                  </span>
+                ))}
+              </div>
+            )}
+          </motion.div>
+        )}
+
+        {/* Evaluation panel */}
         {evaluationResult && (
           <div className="bg-white dark:bg-slate-800 rounded-3xl border border-slate-200 dark:border-slate-700 p-6 shadow-sm space-y-4">
             <div className="flex justify-between items-start">
               <div>
-                <h3 className="font-bold text-slate-900 dark:text-slate-100 text-base">
-                  Sign Evaluation
-                </h3>
+                <h3 className="font-bold text-slate-900 dark:text-slate-100 text-base">Sign Evaluation</h3>
                 <p className="text-slate-500 dark:text-slate-400 text-xs">
                   {evaluationResult.is_correct ? 'Correct execution!' : 'Position adjustment needed'}
                 </p>
@@ -544,7 +964,6 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
               </div>
             </div>
 
-            {/* Wrong Sign / Misidentification Warning Box */}
             {evaluationResult.misidentified_sign && (
               <div className="p-3.5 rounded-2xl bg-amber-50 dark:bg-amber-950/80 border border-amber-300 dark:border-amber-800 text-amber-900 dark:text-amber-200 text-xs space-y-1">
                 <div className="font-black flex items-center gap-1.5 text-amber-700 dark:text-amber-400">
@@ -552,25 +971,22 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
                   <span>Misidentified Sign Detected</span>
                 </div>
                 <p className="leading-relaxed">
-                  You appear to be making the sign for <strong>{evaluationResult.misidentified_sign}</strong> instead of <strong>{currentTarget.label}</strong>!
+                  You appear to be making the sign for <strong>{evaluationResult.misidentified_sign}</strong> instead of{' '}
+                  <strong>{currentTarget.label}</strong>!
                 </p>
               </div>
             )}
 
-            {/* Physical Positioning Advice */}
             {evaluationResult.positioning_advice && (
               <div className="p-3.5 rounded-2xl bg-indigo-50/70 dark:bg-indigo-950/60 border border-indigo-200 dark:border-indigo-800 text-indigo-950 dark:text-indigo-200 text-xs space-y-1">
                 <div className="font-black flex items-center gap-1.5 text-indigo-700 dark:text-indigo-300">
                   <Lightbulb className="w-4 h-4 shrink-0 text-amber-500" />
                   <span>Positioning Advice</span>
                 </div>
-                <p className="leading-relaxed font-medium">
-                  {evaluationResult.positioning_advice}
-                </p>
+                <p className="leading-relaxed font-medium">{evaluationResult.positioning_advice}</p>
               </div>
             )}
 
-            {/* Quick Feedback Tip */}
             <div className="flex items-start gap-2 text-xs font-semibold text-slate-700 dark:text-slate-300 bg-slate-50 dark:bg-slate-900 p-3 rounded-xl border border-slate-200/80 dark:border-slate-800">
               {evaluationResult.is_correct ? (
                 <CheckCircle2 className="w-4 h-4 text-emerald-500 shrink-0 mt-0.5" />
@@ -585,4 +1001,3 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
     </div>
   );
 };
-

@@ -1,7 +1,7 @@
-import React, { useState, useEffect } from 'react';
+import React from 'react';
 import { motion, AnimatePresence } from 'motion/react';
 import { ExpressionType, AnimationTriggerType, MascotConfig } from '../types';
-import { Volume2, VolumeX, Sparkles, HelpCircle } from 'lucide-react';
+import { Volume2, Sparkles, HelpCircle } from 'lucide-react';
 
 interface SignBuddyMascotProps {
   config: MascotConfig;
@@ -9,6 +9,8 @@ interface SignBuddyMascotProps {
   animationTrigger: AnimationTriggerType;
   dialogueBubble: string;
   isEvaluating?: boolean;
+  /** Driven by the Gemini TTS hook so the bubble can pulse while talking. */
+  isSpeaking?: boolean;
   onTalkEnd?: () => void;
   size?: 'sm' | 'md' | 'lg' | 'xl';
 }
@@ -19,46 +21,9 @@ export const SignBuddyMascot: React.FC<SignBuddyMascotProps> = ({
   animationTrigger,
   dialogueBubble,
   isEvaluating = false,
+  isSpeaking = false,
   size = 'lg',
 }) => {
-  const [speechEnabled, setSpeechEnabled] = useState(true);
-  const [isSpeaking, setIsSpeaking] = useState(false);
-
-  // Text to speech when dialogue bubble changes
-  useEffect(() => {
-    if (!dialogueBubble || !speechEnabled || typeof window === 'undefined' || !('speechSynthesis' in window)) {
-      return;
-    }
-
-    try {
-      window.speechSynthesis.cancel();
-      const utterance = new SpeechSynthesisUtterance(dialogueBubble);
-      utterance.rate = 1.05;
-      utterance.pitch = 1.2; // Cheerful higher voice for mascot
-      
-      utterance.onstart = () => setIsSpeaking(true);
-      utterance.onend = () => setIsSpeaking(false);
-      utterance.onerror = () => setIsSpeaking(false);
-
-      window.speechSynthesis.speak(utterance);
-    } catch (e) {
-      console.warn('Speech synthesis error:', e);
-    }
-
-    return () => {
-      if ('speechSynthesis' in window) {
-        window.speechSynthesis.cancel();
-      }
-    };
-  }, [dialogueBubble, speechEnabled]);
-
-  const toggleSpeech = () => {
-    if ('speechSynthesis' in window) {
-      window.speechSynthesis.cancel();
-    }
-    setSpeechEnabled(!speechEnabled);
-  };
-
   // Determine SVG Dimensions based on size
   const sizeMap = {
     sm: 'w-24 h-24',
@@ -123,13 +88,14 @@ export const SignBuddyMascot: React.FC<SignBuddyMascotProps> = ({
               "{dialogueBubble}"
             </div>
             
-            <button
-              onClick={toggleSpeech}
-              title={speechEnabled ? 'Mute Buddy voice' : 'Enable Buddy voice'}
-              className="p-1.5 rounded-lg bg-indigo-50 dark:bg-slate-700 hover:bg-indigo-100 dark:hover:bg-slate-600 text-indigo-600 dark:text-indigo-300 transition-colors shrink-0"
-            >
-              {speechEnabled ? <Volume2 className={`w-4 h-4 ${isSpeaking ? 'animate-bounce text-emerald-500' : ''}`} /> : <VolumeX className="w-4 h-4 text-slate-400" />}
-            </button>
+            {isSpeaking && (
+              <span
+                className="p-1.5 rounded-lg bg-emerald-50 dark:bg-emerald-950/60 text-emerald-600 dark:text-emerald-300 shrink-0"
+                title={`${config.name || 'Buddy'} is speaking`}
+              >
+                <Volume2 className="w-4 h-4 animate-bounce" />
+              </span>
+            )}
 
             {/* Bubble Tail */}
             <div className="absolute -bottom-2.5 left-1/2 -translate-x-1/2 w-4 h-4 bg-white dark:bg-slate-800 border-r-2 border-b-2 border-indigo-200 dark:border-indigo-800 rotate-45" />
@@ -164,6 +130,14 @@ export const SignBuddyMascot: React.FC<SignBuddyMascotProps> = ({
         animate={currentVariant}
         className={`${sizeMap[size]} relative flex items-center justify-center cursor-pointer`}
       >
+        {/* An AI-generated mascot replaces the vector character entirely. */}
+        {config.generatedImage ? (
+          <img
+            src={config.generatedImage}
+            alt={`${config.name || 'Buddy'}, your sign language coach`}
+            className="w-full h-full object-contain drop-shadow-xl"
+          />
+        ) : (
         <svg viewBox="0 0 200 200" className="w-full h-full drop-shadow-xl overflow-visible">
           <defs>
             <linearGradient id="mascotBodyGrad" x1="0%" y1="0%" x2="0%" y2="100%">
@@ -412,6 +386,7 @@ export const SignBuddyMascot: React.FC<SignBuddyMascotProps> = ({
             )}
           </g>
         </svg>
+        )}
 
         {/* Loading Spinner ring during evaluation */}
         {isEvaluating && (

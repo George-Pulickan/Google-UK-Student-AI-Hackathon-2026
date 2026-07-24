@@ -1,7 +1,8 @@
-import React from 'react';
-import { MascotConfig, MascotAnimal, MascotAccessory, MascotOutfit } from '../types';
+import React, { useState } from 'react';
+import { MascotConfig, MascotAnimal, MascotAccessory } from '../types';
 import { SignBuddyMascot } from './SignBuddyMascot';
-import { Sparkles, Palette, Smile, Glasses, UserCheck } from 'lucide-react';
+import { MASCOT_VOICES, useMascotVoice } from '../lib/useMascotVoice';
+import { Sparkles, Palette, Smile, Glasses, UserCheck, Wand2, Trash2, Mic, Volume2 } from 'lucide-react';
 
 interface MascotCustomizerProps {
   config: MascotConfig;
@@ -10,6 +11,40 @@ interface MascotCustomizerProps {
 }
 
 export const MascotCustomizer: React.FC<MascotCustomizerProps> = ({ config, onChange, onClose }) => {
+  const [aiPrompt, setAiPrompt] = useState('');
+  const [isGenerating, setIsGenerating] = useState(false);
+  const [genError, setGenError] = useState<string | null>(null);
+  const { speak, speaking } = useMascotVoice(true, config.voiceName || 'Leda');
+
+  const generateMascot = async () => {
+    setIsGenerating(true);
+    setGenError(null);
+    try {
+      const res = await fetch('/api/generate-mascot', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          prompt: aiPrompt.trim() || undefined,
+          name: config.name,
+          animal: config.animal,
+          color: config.color,
+          accessory: config.accessory,
+          outfit: config.outfit,
+        }),
+      });
+      if (!res.ok) {
+        const detail = await res.json().catch(() => null);
+        throw new Error(detail?.details || detail?.error || `Server returned ${res.status}`);
+      }
+      const data = await res.json();
+      onChange({ ...config, generatedImage: data.imageDataUrl });
+    } catch (err: any) {
+      setGenError(err?.message || 'Could not generate a mascot.');
+    } finally {
+      setIsGenerating(false);
+    }
+  };
+
   const animals: Array<{ id: MascotAnimal; name: string; emoji: string }> = [
     { id: 'fox', name: 'Fiery Fox', emoji: '🦊' },
     { id: 'bear', name: 'Honey Bear', emoji: '🐻' },
@@ -155,7 +190,93 @@ export const MascotCustomizer: React.FC<MascotCustomizerProps> = ({ config, onCh
               ))}
             </div>
           </div>
+
+          {/* Coaching voice */}
+          <div>
+            <label className="text-xs font-extrabold text-indigo-600 dark:text-indigo-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+              <Mic className="w-4 h-4" /> Coaching Voice
+            </label>
+            <div className="flex items-center gap-2">
+              <select
+                value={config.voiceName || 'Leda'}
+                onChange={(e) => onChange({ ...config, voiceName: e.target.value })}
+                className="flex-1 px-3 py-2 bg-white dark:bg-slate-900 border-2 border-slate-200 dark:border-slate-700
+                           rounded-xl text-xs font-bold text-slate-800 dark:text-slate-200 focus:outline-none
+                           focus:border-indigo-500 cursor-pointer"
+              >
+                {MASCOT_VOICES.map((v) => (
+                  <option key={v.id} value={v.id}>
+                    {v.label}
+                  </option>
+                ))}
+              </select>
+              <button
+                onClick={() =>
+                  speak(
+                    `Hi! I'm ${config.name || 'Buddy'}, and I'll be your sign language coach. Let's learn something new today!`,
+                    'CHEERING'
+                  )
+                }
+                className="px-3 py-2 rounded-xl bg-indigo-50 dark:bg-indigo-950/60 text-indigo-600 dark:text-indigo-300
+                           hover:bg-indigo-100 dark:hover:bg-indigo-900/60 transition-colors cursor-pointer
+                           text-xs font-bold flex items-center gap-1.5 shrink-0"
+                title="Preview this voice"
+              >
+                <Volume2 className={`w-4 h-4 ${speaking ? 'animate-pulse' : ''}`} />
+                Test
+              </button>
+            </div>
+          </div>
         </div>
+      </div>
+
+      {/* AI mascot generation */}
+      <div className="mt-6 pt-5 border-t border-slate-100 dark:border-slate-700">
+        <label className="text-xs font-extrabold text-violet-600 dark:text-violet-400 uppercase tracking-wider mb-2 flex items-center gap-1.5">
+          <Wand2 className="w-4 h-4" /> Generate a Mascot with AI
+        </label>
+        <p className="text-[11px] text-slate-500 dark:text-slate-400 mb-2.5 leading-relaxed">
+          Describe your ideal buddy, or leave it blank to build one from the options above. Generated art
+          replaces the vector mascot everywhere in the app.
+        </p>
+
+        <div className="flex flex-col sm:flex-row items-stretch gap-2">
+          <input
+            value={aiPrompt}
+            onChange={(e) => setAiPrompt(e.target.value)}
+            onKeyDown={(e) => e.key === 'Enter' && !isGenerating && generateMascot()}
+            placeholder="e.g. a friendly robot owl wearing a scarf, waving hello"
+            className="flex-1 px-3.5 py-2.5 bg-slate-50 dark:bg-slate-900 border-2 border-slate-200 dark:border-slate-700
+                       rounded-xl text-xs font-medium text-slate-800 dark:text-slate-100 placeholder:text-slate-400
+                       focus:outline-none focus:border-violet-500"
+          />
+          <button
+            onClick={generateMascot}
+            disabled={isGenerating}
+            className="px-5 py-2.5 bg-violet-600 hover:bg-violet-700 text-white rounded-xl font-black text-xs
+                       shadow-md transition-all flex items-center justify-center gap-2 disabled:opacity-50 cursor-pointer shrink-0"
+          >
+            <Sparkles className={`w-4 h-4 ${isGenerating ? 'animate-pulse' : ''}`} />
+            {isGenerating ? 'Drawing…' : 'Generate'}
+          </button>
+
+          {config.generatedImage && (
+            <button
+              onClick={() => onChange({ ...config, generatedImage: null })}
+              className="px-3.5 py-2.5 bg-slate-100 dark:bg-slate-700 hover:bg-rose-50 dark:hover:bg-rose-950/50
+                         text-slate-600 dark:text-slate-300 hover:text-rose-600 dark:hover:text-rose-400
+                         rounded-xl font-bold text-xs transition-colors flex items-center justify-center gap-1.5 cursor-pointer shrink-0"
+              title="Remove generated art and return to the vector mascot"
+            >
+              <Trash2 className="w-4 h-4" />
+              <span className="sm:hidden">Remove generated art</span>
+            </button>
+          )}
+        </div>
+
+        {genError && (
+          <p className="mt-2 text-[11px] font-bold text-rose-600 dark:text-rose-400">{genError}</p>
+        )}
       </div>
     </div>
   );
