@@ -1,0 +1,10 @@
+{
+  "name": "SignBuddy - AI Sign Language Tutor",
+  "description": "An interactive AI Sign Language Tutor and Mascot Controller that evaluates sign language gestures using Gemini Vision and animates an energetic mascot avatar.",
+  "requestFramePermissions": [
+    "camera"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
