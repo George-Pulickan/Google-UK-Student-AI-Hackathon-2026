@@ -1,4 +1,4 @@
-import { HandLandmark } from '../types';
+import { HandLandmark, TrackedHand } from '../types';
 
 /** MediaPipe hand topology: 21 landmarks wired into five digits plus a palm arch. */
 export const HAND_CONNECTIONS: Array<[number, number]> = [
@@ -30,6 +30,8 @@ export interface DrawSkeletonOptions {
   scale?: number;
   /** 0-1 opacity for the whole skeleton. */
   opacity?: number;
+  /** Base hue for correct/neutral joints; lets a second hand read differently. */
+  hue?: number;
 }
 
 /**
@@ -58,6 +60,7 @@ export function drawHandSkeleton(
 
   const { mirrored = false, markCorrect = false, scale = 1, opacity = 1 } = options;
   const wrong = options.wrong instanceof Set ? options.wrong : new Set(options.wrong ?? []);
+  const baseHue = options.hue ?? (markCorrect ? 152 : 190);
 
   const px = (p: HandLandmark) => ({
     x: (mirrored ? 1 - p.x : p.x) * width,
@@ -83,7 +86,7 @@ export function drawHandSkeleton(
 
     // Nearer bones are brighter; further ones recede into the background.
     const light = Math.round(45 + depth * 22);
-    const hue = isWrong ? 352 : markCorrect ? 152 : 190;
+    const hue = isWrong ? 352 : baseHue;
     const sat = isWrong ? 90 : markCorrect ? 70 : 95;
 
     // Soft outer glow gives the limb volume.
@@ -123,7 +126,7 @@ export function drawHandSkeleton(
     const base = (isTip ? 4.4 : 3.4) + p.d * 2.2;
     const r = base * scale * (isWrong ? 1.35 : 1);
 
-    const hue = isWrong ? 352 : markCorrect ? 152 : 190;
+    const hue = isWrong ? 352 : baseHue;
     const sat = isWrong ? 92 : markCorrect ? 72 : 92;
 
     if (isWrong) {
@@ -185,4 +188,44 @@ export function landmarkMotion(a: HandLandmark[] | null, b: HandLandmark[] | nul
     total += Math.hypot(dx, dy);
   }
   return total / a.length;
+}
+
+/**
+ * Motion across every tracked hand. A change in hand count counts as motion,
+ * so a second hand entering or leaving frame restarts the settle timer rather
+ * than silently comparing mismatched sets.
+ */
+export function handsMotion(a: TrackedHand[] | null, b: TrackedHand[] | null): number {
+  if (!a || !b || !a.length || a.length !== b.length) return Infinity;
+  let worst = 0;
+  for (let i = 0; i < a.length; i++) {
+    worst = Math.max(worst, landmarkMotion(a[i].landmarks, b[i].landmarks));
+  }
+  return worst;
+}
+
+/** Combined bounds over every tracked hand, for the in-box test. */
+export function handsBounds(hands: TrackedHand[]) {
+  return landmarkBounds(hands.flatMap((h) => h.landmarks));
+}
+
+/** Distinct base hues so a second hand is visually separable from the first. */
+export const HAND_HUES = [190, 265];
+
+/**
+ * Normalises a MediaPipe VIDEO result into our TrackedHand shape.
+ * Hands are ordered left-to-right on screen so that indices stay stable
+ * between frames — MediaPipe's own ordering is detection order, which can
+ * swap and would make the flagged-joint indices point at the wrong hand.
+ */
+export function readHands(result: any): TrackedHand[] {
+  const sets: any[] = result?.landmarks ?? [];
+  if (!sets.length) return [];
+
+  return sets
+    .map((landmarks: HandLandmark[], i: number) => ({
+      landmarks,
+      handedness: (result?.handednesses?.[i]?.[0]?.categoryName ?? 'Unknown') as TrackedHand['handedness'],
+    }))
+    .sort((a, b) => landmarkBounds(a.landmarks).centerX - landmarkBounds(b.landmarks).centerX);
 }

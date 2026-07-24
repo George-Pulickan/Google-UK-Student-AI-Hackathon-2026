@@ -1,9 +1,10 @@
 import React, { useRef, useState, useEffect, useCallback } from 'react';
 import { motion, AnimatePresence } from 'motion/react';
-import { AnySignResult, MascotConfig, SignLanguageSystem, HandLandmark } from '../types';
+import { AnySignResult, MascotConfig, SignLanguageSystem, TrackedHand } from '../types';
 import { useHandLandmarker } from '../lib/useHandLandmarker';
+import { openCameraStream, waitForVideoElement } from '../lib/camera';
 import { useMascotVoice } from '../lib/useMascotVoice';
-import { drawHandSkeleton } from '../lib/handSkeleton';
+import { drawHandSkeleton, readHands, HAND_HUES } from '../lib/handSkeleton';
 import { A2UIRenderer } from './A2UIRenderer';
 import { MascotAvatar } from './MascotAvatar';
 import {
@@ -51,7 +52,7 @@ export const AnySignStudio: React.FC<AnySignStudioProps> = ({
   const stageRef = useRef<HTMLDivElement | null>(null);
   const rafRef = useRef<number | null>(null);
   const lastVideoTimeRef = useRef(-1);
-  const liveLandmarksRef = useRef<HandLandmark[] | null>(null);
+  const liveHandsRef = useRef<TrackedHand[]>([]);
 
   const { landmarkerRef, ready: trackingReady } = useHandLandmarker();
   const { speak, speaking } = useMascotVoice(voiceEnabled, mascotConfig.voiceName || 'Leda');
@@ -64,10 +65,8 @@ export const AnySignStudio: React.FC<AnySignStudioProps> = ({
     cameraStartingRef.current = true;
     setCameraError(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
-      });
-      const video = videoRef.current;
+      const stream = await openCameraStream();
+      const video = await waitForVideoElement(() => videoRef.current);
       if (!video) {
         stream.getTracks().forEach((t) => t.stop());
         return;
@@ -122,21 +121,27 @@ export const AnySignStudio: React.FC<AnySignStudioProps> = ({
       if (video.currentTime !== lastVideoTimeRef.current) {
         lastVideoTimeRef.current = video.currentTime;
         try {
-          const res = landmarker.detectForVideo(video, performance.now());
-          liveLandmarksRef.current = (res.landmarks?.[0] as HandLandmark[]) ?? null;
+          liveHandsRef.current = readHands(landmarker.detectForVideo(video, performance.now()));
         } catch {
-          liveLandmarksRef.current = null;
+          liveHandsRef.current = [];
         }
       }
 
-      const hand = liveLandmarksRef.current;
-      if (hand) {
+      const hands = liveHandsRef.current;
+      if (hands.length) {
         const scale = Math.max(cw / video.videoWidth, ch / video.videoHeight);
         const dw = video.videoWidth * scale;
         const dh = video.videoHeight * scale;
         ctx.save();
         ctx.translate((cw - dw) / 2, (ch - dh) / 2);
-        drawHandSkeleton(ctx, hand, dw, dh, { mirrored: true, scale: Math.max(0.75, cw / 640), opacity: 0.85 });
+        hands.forEach((hand, i) => {
+          drawHandSkeleton(ctx, hand.landmarks, dw, dh, {
+            mirrored: true,
+            hue: HAND_HUES[i % HAND_HUES.length],
+            scale: Math.max(0.75, cw / 640),
+            opacity: 0.85,
+          });
+        });
         ctx.restore();
       }
     };

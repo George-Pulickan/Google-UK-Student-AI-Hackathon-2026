@@ -5,8 +5,11 @@ import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
  * Loads the MediaPipe hand landmarker once per page.
  * Both the wasm bundle and the .task model are served from /public, so the
  * app keeps working without reaching out to a CDN.
+ *
+ * Defaults to two hands: BSL fingerspelling is two-handed, and tracking both
+ * costs little when only one is in frame.
  */
-export function useHandLandmarker() {
+export function useHandLandmarker(numHands = 2) {
   const [ready, setReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const landmarkerRef = useRef<HandLandmarker | null>(null);
@@ -23,7 +26,7 @@ export function useHandLandmarker() {
             delegate: 'GPU',
           },
           runningMode: 'VIDEO',
-          numHands: 1,
+          numHands,
           minHandDetectionConfidence: 0.5,
           minHandPresenceConfidence: 0.5,
           minTrackingConfidence: 0.5,
@@ -45,7 +48,7 @@ export function useHandLandmarker() {
       landmarkerRef.current?.close();
       landmarkerRef.current = null;
     };
-  }, []);
+  }, [numHands]);
 
   return { landmarkerRef, ready, error };
 }

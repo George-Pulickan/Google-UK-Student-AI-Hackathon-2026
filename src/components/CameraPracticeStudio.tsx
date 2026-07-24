@@ -6,15 +6,23 @@ import {
   SignEvaluationResult,
   MascotConfig,
   SignLanguageSystem,
-  HandLandmark,
+  TrackedHand,
 } from '../types';
 import { getSignTargets } from '../data/signsData';
 import { SignBuddyMascot } from './SignBuddyMascot';
 import { HandShapeGuide } from './HandShapeGuide';
 import { TargetSignCue } from './TargetSignCue';
 import { useHandLandmarker } from '../lib/useHandLandmarker';
-import { useMascotVoice } from '../lib/useMascotVoice';
-import { drawHandSkeleton, landmarkBounds, landmarkMotion, LANDMARK_LABELS } from '../lib/handSkeleton';
+import { openCameraStream, waitForVideoElement } from '../lib/camera';
+import { useMascotVoice, spokenVerdict } from '../lib/useMascotVoice';
+import {
+  drawHandSkeleton,
+  handsBounds,
+  handsMotion,
+  readHands,
+  HAND_HUES,
+  LANDMARK_LABELS,
+} from '../lib/handSkeleton';
 import {
   Camera,
   RotateCcw,
@@ -79,7 +87,7 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
 
   // Hand tracking / auto-capture
   const [autoCapture, setAutoCapture] = useState(true);
-  const [handPresent, setHandPresent] = useState(false);
+  const [handCount, setHandCount] = useState(0);
   const [handInBox, setHandInBox] = useState(false);
   const [handSteady, setHandSteady] = useState(false);
   const [reviewImage, setReviewImage] = useState<string | null>(null);
@@ -95,27 +103,24 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
   // rAF-loop scratch state — kept in refs so the loop never reads stale props.
   const rafRef = useRef<number | null>(null);
   const lastVideoTimeRef = useRef(-1);
-  const liveLandmarksRef = useRef<HandLandmark[] | null>(null);
-  const prevLandmarksRef = useRef<HandLandmark[] | null>(null);
-  const capturedLandmarksRef = useRef<HandLandmark[] | null>(null);
+  const liveHandsRef = useRef<TrackedHand[]>([]);
+  const prevHandsRef = useRef<TrackedHand[]>([]);
   const stillFramesRef = useRef(0);
   const cooldownUntilRef = useRef(0);
   const countdownTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const loopStateRef = useRef({
-    autoCapture: true,
-    isEvaluating: false,
-    counting: false,
-    hasUpload: false,
-  });
+  /**
+   * Single source of truth for "is the auto-capture pipeline busy".
+   * React state lags a render behind the rAF loop, which previously let the
+   * loop re-arm a countdown in the gap between one finishing and evaluation
+   * starting. This ref flips synchronously, so there is no gap.
+   */
+  const phaseRef = useRef<'idle' | 'counting' | 'evaluating'>('idle');
+
+  const loopStateRef = useRef({ autoCapture: true, hasUpload: false });
   useEffect(() => {
-    loopStateRef.current = {
-      autoCapture,
-      isEvaluating,
-      counting: countdown !== null,
-      hasUpload: uploadedImage !== null,
-    };
-  }, [autoCapture, isEvaluating, countdown, uploadedImage]);
+    loopStateRef.current = { autoCapture, hasUpload: uploadedImage !== null };
+  }, [autoCapture, uploadedImage]);
 
   /* ---------------------------------------------------------------- *
    * Camera lifecycle
@@ -129,10 +134,8 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
     cameraStartingRef.current = true;
     setCameraError(null);
     try {
-      const stream = await navigator.mediaDevices.getUserMedia({
-        video: { width: { ideal: 640 }, height: { ideal: 480 }, facingMode: 'user' },
-      });
-      const video = videoRef.current;
+      const stream = await openCameraStream();
+      const video = await waitForVideoElement(() => videoRef.current);
       if (!video) {
         stream.getTracks().forEach((t) => t.stop());
         return;
@@ -236,38 +239,37 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
       // Only run inference on genuinely new frames.
       if (video.currentTime !== lastVideoTimeRef.current) {
         lastVideoTimeRef.current = video.currentTime;
-        let hand: HandLandmark[] | null = null;
+        let hands: TrackedHand[] = [];
         try {
-          const result = landmarker.detectForVideo(video, performance.now());
-          hand = (result.landmarks?.[0] as HandLandmark[]) ?? null;
+          hands = readHands(landmarker.detectForVideo(video, performance.now()));
         } catch {
-          hand = null;
+          hands = [];
         }
 
-        prevLandmarksRef.current = liveLandmarksRef.current;
-        liveLandmarksRef.current = hand;
+        prevHandsRef.current = liveHandsRef.current;
+        liveHandsRef.current = hands;
 
-        if (hand) {
-          const travel = landmarkMotion(prevLandmarksRef.current, hand);
+        if (hands.length) {
+          const travel = handsMotion(prevHandsRef.current, hands);
           if (travel < STILL_THRESHOLD) stillFramesRef.current += 1;
           else stillFramesRef.current = 0;
 
           // Abort a running countdown if the hand bolts.
-          if (loopStateRef.current.counting && travel > BREAK_THRESHOLD) {
+          if (phaseRef.current === 'counting' && travel > BREAK_THRESHOLD) {
             abortCountdown();
           }
         } else {
           stillFramesRef.current = 0;
-          if (loopStateRef.current.counting) abortCountdown();
+          if (phaseRef.current === 'counting') abortCountdown();
         }
       }
 
-      const hand = liveLandmarksRef.current;
+      const hands = liveHandsRef.current;
       const { dw, dh, ox, oy } = coverTransform(video, cw, ch);
 
       let inBox = false;
-      if (hand) {
-        const bounds = landmarkBounds(hand);
+      if (hands.length) {
+        const bounds = handsBounds(hands);
         // Mirror to display space, then map through the cover crop.
         const displayX = (ox + (1 - bounds.centerX) * dw) / cw;
         const displayY = (oy + bounds.centerY * dh) / ch;
@@ -279,16 +281,19 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
 
         ctx.save();
         ctx.translate(ox, oy);
-        drawHandSkeleton(ctx, hand, dw, dh, {
-          mirrored: true,
-          scale: Math.max(0.75, cw / 640),
-          opacity: loopStateRef.current.counting ? 0.95 : 0.85,
+        hands.forEach((hand, i) => {
+          drawHandSkeleton(ctx, hand.landmarks, dw, dh, {
+            mirrored: true,
+            hue: HAND_HUES[i % HAND_HUES.length],
+            scale: Math.max(0.75, cw / 640),
+            opacity: phaseRef.current === 'counting' ? 0.95 : 0.85,
+          });
         });
         ctx.restore();
       }
 
-      const steady = !!hand && stillFramesRef.current >= STILL_FRAMES_REQUIRED;
-      setHandPresent((v) => (v !== !!hand ? !!hand : v));
+      const steady = hands.length > 0 && stillFramesRef.current >= STILL_FRAMES_REQUIRED;
+      setHandCount((v) => (v !== hands.length ? hands.length : v));
       setHandInBox((v) => (v !== inBox ? inBox : v));
       setHandSteady((v) => (v !== steady ? steady : v));
 
@@ -296,10 +301,9 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
       const s = loopStateRef.current;
       if (
         s.autoCapture &&
-        !s.isEvaluating &&
-        !s.counting &&
         !s.hasUpload &&
-        hand &&
+        phaseRef.current === 'idle' &&
+        hands.length > 0 &&
         inBox &&
         steady &&
         performance.now() > cooldownUntilRef.current
@@ -325,52 +329,71 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
     }
     setCountdown(null);
     stillFramesRef.current = 0;
+    if (phaseRef.current === 'counting') phaseRef.current = 'idle';
   }, []);
 
+  /**
+   * Always points at the current captureAndEvaluate.
+   *
+   * This is the fix for the countdown that looped forever: beginCountdown is
+   * created once, so it used to close over the very first captureAndEvaluate,
+   * which had captured isCameraActive === false from the initial render. That
+   * stale copy bailed out before taking a picture and before setting the
+   * cooldown, so the loop saw a steady hand and immediately restarted at 3.
+   */
+  const captureRef = useRef<() => void>(() => {});
+
   const beginCountdown = useCallback(() => {
-    if (countdownTimerRef.current) return;
-    setCountdown(3);
+    if (countdownTimerRef.current || phaseRef.current !== 'idle') return;
+
+    phaseRef.current = 'counting';
+    let remaining = 3;
+    setCountdown(remaining);
+
     countdownTimerRef.current = setInterval(() => {
-      setCountdown((prev) => {
-        if (prev === null) return null;
-        if (prev <= 1) {
-          if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
-          countdownTimerRef.current = null;
-          captureAndEvaluate();
-          return null;
-        }
-        return prev - 1;
-      });
+      remaining -= 1;
+      if (remaining > 0) {
+        setCountdown(remaining);
+        return;
+      }
+
+      if (countdownTimerRef.current) clearInterval(countdownTimerRef.current);
+      countdownTimerRef.current = null;
+      setCountdown(null);
+      // Fire the capture outside the state updater — React may invoke an
+      // updater twice, which would double-submit the frame.
+      captureRef.current();
     }, 1000);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   /* ---------------------------------------------------------------- *
    * Capture, evaluate, annotate
    * ---------------------------------------------------------------- */
 
-  /** Paints the captured still with the skeleton, flagged joints in red. */
+  /** Paints the captured still with every skeleton, flagged joints in red. */
   const buildReviewImage = useCallback(
-    (source: HTMLCanvasElement | HTMLImageElement, landmarks: HandLandmark[] | null, wrong: number[]) => {
-      if (!landmarks?.length) return null;
-      const w = 'videoWidth' in source ? (source as any).videoWidth : source.width;
-      const h = 'videoHeight' in source ? (source as any).videoHeight : source.height;
+    (source: HTMLCanvasElement, hands: TrackedHand[], wrongPerHand: number[][]) => {
+      if (!hands.length) return null;
+      const w = source.width;
+      const h = source.height;
       const out = document.createElement('canvas');
       out.width = w;
       out.height = h;
       const ctx = out.getContext('2d');
       if (!ctx) return null;
 
-      ctx.drawImage(source as CanvasImageSource, 0, 0, w, h);
+      ctx.drawImage(source, 0, 0, w, h);
       // Darken slightly so the armature reads against a bright room.
       ctx.fillStyle = 'rgba(2, 6, 23, 0.35)';
       ctx.fillRect(0, 0, w, h);
 
-      drawHandSkeleton(ctx, landmarks, w, h, {
-        mirrored: false,
-        wrong,
-        markCorrect: true,
-        scale: Math.max(1, w / 640),
+      hands.forEach((hand, i) => {
+        drawHandSkeleton(ctx, hand.landmarks, w, h, {
+          mirrored: false,
+          wrong: wrongPerHand[i] ?? [],
+          markCorrect: true,
+          scale: Math.max(1, w / 640),
+        });
       });
       return out.toDataURL('image/jpeg', 0.9);
     },
@@ -378,13 +401,22 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
   );
 
   const captureAndEvaluate = useCallback(async () => {
+    // Claim the pipeline up-front so the rAF loop cannot re-arm underneath us,
+    // and guarantee a cooldown on every exit path — including the early ones.
+    phaseRef.current = 'evaluating';
+    const release = () => {
+      stillFramesRef.current = 0;
+      cooldownUntilRef.current = performance.now() + COOLDOWN_MS;
+      phaseRef.current = 'idle';
+    };
+
     let imageBase64: string | null = null;
     let sourceCanvas: HTMLCanvasElement | null = null;
-    const landmarks = liveLandmarksRef.current ? [...liveLandmarksRef.current] : null;
+    const hands = liveHandsRef.current.map((h) => ({ ...h, landmarks: [...h.landmarks] }));
 
     if (uploadedImage) {
       imageBase64 = uploadedImage;
-    } else if (isCameraActive && videoRef.current && canvasRef.current) {
+    } else if (videoRef.current?.srcObject && canvasRef.current) {
       const video = videoRef.current;
       const canvas = canvasRef.current;
       canvas.width = video.videoWidth || 640;
@@ -400,10 +432,10 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
 
     if (!imageBase64) {
       setCameraError('Turn on the camera or upload an image frame first.');
+      release();
       return;
     }
 
-    capturedLandmarksRef.current = landmarks;
     setIsEvaluating(true);
     setEvaluationResult(null);
     setReviewImage(null);
@@ -418,7 +450,7 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
           targetSign: currentTarget,
           mascotName: mascotConfig.name,
           signSystem,
-          landmarks,
+          hands: hands.map((h) => ({ handedness: h.handedness, landmarks: h.landmarks })),
         }),
       });
 
@@ -427,13 +459,17 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
       const data: SignEvaluationResult = await response.json();
       setEvaluationResult(data);
 
-      if (sourceCanvas && landmarks) {
-        setReviewImage(buildReviewImage(sourceCanvas, landmarks, data.incorrect_landmarks ?? []));
+      if (sourceCanvas && hands.length) {
+        setReviewImage(
+          buildReviewImage(sourceCanvas, hands, [
+            data.incorrect_landmarks ?? [],
+            data.incorrect_landmarks_hand2 ?? [],
+          ])
+        );
       }
 
-      if (data.avatar_reaction?.dialogue_bubble) {
-        speak(data.avatar_reaction.dialogue_bubble, data.avatar_reaction.expression);
-      }
+      // Always say something about the outcome, right or wrong.
+      speak(spokenVerdict(data), data.avatar_reaction?.expression);
 
       if (data.is_correct) {
         confetti({
@@ -451,7 +487,7 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
       onEvaluationComplete(currentTarget, data);
     } catch (err: any) {
       console.error('Error evaluating sign:', err);
-      setEvaluationResult({
+      const fallback: SignEvaluationResult = {
         is_correct: false,
         accuracy_score: 55,
         feedback_tip: 'Make sure your hand is in clear focus with good lighting!',
@@ -463,14 +499,20 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
           animation_trigger: 'idle_confused',
           dialogue_bubble: `Oops! Let's try again. Position your hand right in front of the camera!`,
         },
-      });
+      };
+      setEvaluationResult(fallback);
+      speak(spokenVerdict(fallback), 'CONFUSED');
     } finally {
       setIsEvaluating(false);
-      stillFramesRef.current = 0;
-      cooldownUntilRef.current = performance.now() + COOLDOWN_MS;
+      release();
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [uploadedImage, isCameraActive, currentTarget, mascotConfig.name, signSystem, currentStepIndex]);
+  }, [uploadedImage, currentTarget, mascotConfig.name, signSystem, currentStepIndex, speak, stopSpeech]);
+
+  // Keep the countdown's escape hatch pointing at the live capture function.
+  useEffect(() => {
+    captureRef.current = captureAndEvaluate;
+  }, [captureAndEvaluate]);
 
   const handleFileUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
@@ -497,20 +539,32 @@ export const CameraPracticeStudio: React.FC<CameraPracticeStudioProps> = ({
   };
 
   const stepsList = currentTarget.steps || [currentTarget.description];
-  const wrongJoints = evaluationResult?.incorrect_landmarks ?? [];
+  const wrongJoints = [
+    ...(evaluationResult?.incorrect_landmarks ?? []),
+    ...(evaluationResult?.incorrect_landmarks_hand2 ?? []),
+  ];
 
   // Human-readable summary of which joints Gemini flagged.
-  const wrongJointNames = Array.from(new Set(wrongJoints.map((i) => LANDMARK_LABELS[i]).filter(Boolean)));
+  const wrongJointNames = Array.from(
+    new Set(
+      [
+        ...(evaluationResult?.incorrect_landmarks ?? []),
+        ...(evaluationResult?.incorrect_landmarks_hand2 ?? []),
+      ]
+        .map((i) => LANDMARK_LABELS[i])
+        .filter(Boolean)
+    )
+  );
 
   const trackingStatus = !trackingReady
     ? { label: 'Loading hand model…', tone: 'bg-slate-500' }
-    : !handPresent
+    : handCount === 0
     ? { label: 'No hand detected', tone: 'bg-slate-500' }
     : !handInBox
     ? { label: 'Move hand into the box', tone: 'bg-amber-500' }
     : !handSteady
     ? { label: 'Hold still…', tone: 'bg-sky-500' }
-    : { label: 'Locked on', tone: 'bg-emerald-500' };
+    : { label: `Locked on · ${handCount} hand${handCount > 1 ? 's' : ''}`, tone: 'bg-emerald-500' };
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-12 gap-6">

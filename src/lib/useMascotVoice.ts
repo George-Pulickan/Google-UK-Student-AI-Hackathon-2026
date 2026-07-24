@@ -1,5 +1,24 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { ExpressionType } from '../types';
+import { ExpressionType, SignEvaluationResult } from '../types';
+
+/**
+ * Builds the line spoken after an attempt.
+ *
+ * The verdict is stated first so the learner knows the outcome before the
+ * coaching detail arrives — useful when they are still looking at their hand
+ * rather than the screen.
+ */
+export function spokenVerdict(result: SignEvaluationResult): string {
+  const coaching = (result.avatar_reaction?.dialogue_bubble || result.feedback_tip || '').trim();
+  const lead = result.is_correct
+    ? pick(["That's correct!", 'Nailed it!', "Perfect, that's the one!", 'Yes, spot on!'])
+    : pick(['Not quite yet.', 'Close, but not quite.', "Almost — let's fix one thing.", 'Nearly there.']);
+  return coaching ? `${lead} ${coaching}` : lead;
+}
+
+function pick(options: string[]): string {
+  return options[Math.floor(Math.random() * options.length)];
+}
 
 /** Prebuilt Gemini TTS voices that suit a friendly tutor. */
 export const MASCOT_VOICES = [

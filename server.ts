@@ -67,10 +67,27 @@ function describeLandmarks(landmarks: Array<{ x: number; y: number; z: number }>
     .join(' ');
 }
 
+/**
+ * Renders every tracked hand for the prompt. Hands arrive ordered left-to-right
+ * on screen, which is also the order the incorrect_landmarks arrays map onto.
+ */
+function describeHands(hands: any[]): string {
+  if (!Array.isArray(hands) || !hands.length) return '';
+  return hands
+    .map((hand, i) => {
+      const points = describeLandmarks(hand?.landmarks);
+      if (!points) return '';
+      const label = i === 0 ? 'HAND 1 (leftmost on screen)' : `HAND ${i + 1}`;
+      return `${label} [${hand?.handedness || 'Unknown'} hand]:\n${points}`;
+    })
+    .filter(Boolean)
+    .join('\n\n');
+}
+
 // Evaluate Sign Language Gesture Endpoint
 app.post('/api/evaluate-sign', async (req, res) => {
   try {
-    const { imageBase64, targetSign, mascotName, signSystem, landmarks } = req.body;
+    const { imageBase64, targetSign, mascotName, signSystem, landmarks, hands } = req.body;
 
     if (!targetSign || !targetSign.id) {
       return res.status(400).json({ error: 'Missing targetSign parameter.' });
@@ -91,7 +108,15 @@ app.post('/api/evaluate-sign', async (req, res) => {
     }
 
     const currentSystem = signSystem || targetSign.system || 'ASL';
-    const landmarkText = describeLandmarks(landmarks);
+    // `hands` is the current multi-hand payload; `landmarks` is the older
+    // single-hand shape, still accepted so nothing breaks mid-session.
+    const trackedHands = Array.isArray(hands) && hands.length
+      ? hands
+      : Array.isArray(landmarks) && landmarks.length
+      ? [{ handedness: 'Unknown', landmarks }]
+      : [];
+    const landmarkText = describeHands(trackedHands);
+    const handCount = trackedHands.length;
 
     const systemInstruction = `You are "SignBuddy", an expert AI Sign Language Tutor and Mascot Controller for an educational app.
 YOUR PURPOSE:
@@ -104,12 +129,23 @@ IMPORTANT DIAGNOSTIC FEATURE:
 3. Provide step-by-step 'positioning_advice' explaining how to adjust their fingers/hand from what they are currently doing to achieve the correct target sign "${targetSign.label}".
 
 SKELETON DIAGNOSIS:
-The app tracks 21 hand landmarks (MediaPipe ordering, normalised 0-1 image coords, origin top-left):
+The app tracks 21 landmarks per hand (MediaPipe ordering, normalised 0-1 image coords, origin top-left):
 0 wrist | 1-4 thumb (cmc, mcp, ip, tip) | 5-8 index (mcp, pip, dip, tip) | 9-12 middle | 13-16 ring | 17-20 pinky.
-Populate 'incorrect_landmarks' with the INDICES (0-20) of the joints that are positioned wrongly for the target sign, so the app can paint those joints red on the student's skeleton.
-- If the sign is correct, return an empty array.
-- Only flag joints you are genuinely confident are misplaced — typically 2 to 8 of them, concentrated on the fingers that are wrong.
+This frame has ${handCount} tracked hand(s)${
+      currentSystem === 'BSL'
+        ? '. BSL fingerspelling is two-handed: the non-dominant hand is the base and the dominant hand points or touches it, so judge BOTH hands and how they meet.'
+        : '.'
+    }
+Populate 'incorrect_landmarks' with the INDICES (0-20) of the joints positioned wrongly on HAND 1, so the app can paint those joints red on the student's skeleton.
+${handCount > 1 ? "Use 'incorrect_landmarks_hand2' for the same on HAND 2." : "Leave 'incorrect_landmarks_hand2' empty — only one hand is in frame."}
+- If the sign is correct, return empty arrays.
+- Only flag joints you are genuinely confident are misplaced — typically 2 to 8 per hand, concentrated on the fingers that are wrong.
 - Prefer flagging fingertips and the PIP/DIP joints of the offending fingers rather than the whole hand.
+${
+  currentSystem === 'BSL' && handCount < 2
+    ? "- IMPORTANT: this BSL sign needs two hands but only one is visible. Say so in the feedback and set is_correct false."
+    : ''
+}
 
 AVATAR CONTROL RULES:
 Configure 'avatar_reaction' object:
@@ -128,7 +164,7 @@ Target Sign: "${targetSign.label}" (ID: ${targetSign.id}).
 Category: ${targetSign.category}
 Description: ${targetSign.description}
 Hand shape detail: ${targetSign.handShapeDescription}
-${landmarkText ? `\nDetected hand landmarks for this frame:\n${landmarkText}` : '\nNo hand landmarks were detected for this frame.'}
+${landmarkText ? `\nDetected hand landmarks for this frame (${handCount} hand(s)):\n${landmarkText}` : '\nNo hand landmarks were detected for this frame.'}
 
 Carefully analyze the image:
 1. Identify visible hand gesture & name it in 'detected_gesture'.
@@ -183,7 +219,14 @@ Carefully analyze the image:
             },
             incorrect_landmarks: {
               type: Type.ARRAY,
-              description: 'Indices (0-20) of hand landmarks that are positioned incorrectly. Empty when the sign is correct.',
+              description: 'Indices (0-20) of misplaced landmarks on HAND 1. Empty when correct.',
+              maxItems: 12,
+              items: { type: Type.NUMBER },
+            },
+            incorrect_landmarks_hand2: {
+              type: Type.ARRAY,
+              description: 'Indices (0-20) of misplaced landmarks on HAND 2. Empty when correct or absent.',
+              maxItems: 12,
               items: { type: Type.NUMBER },
             },
             avatar_reaction: {
@@ -232,16 +275,24 @@ Carefully analyze the image:
       };
     }
 
-    // Gemini sometimes emits the string "null" for the optional field
-    if (parsedResult.misidentified_sign === 'null' || parsedResult.misidentified_sign === '') {
+    // Gemini sometimes fills the optional field with a literal "null"/"none"
+    // rather than omitting it, which would render as a bogus warning banner.
+    const placeholder = String(parsedResult.misidentified_sign ?? '').trim().toLowerCase();
+    if (!placeholder || placeholder === 'null' || placeholder === 'none' || placeholder === 'n/a') {
       parsedResult.misidentified_sign = null;
     }
     // Keep only in-range landmark indices so the overlay can trust them
-    parsedResult.incorrect_landmarks = Array.isArray(parsedResult.incorrect_landmarks)
-      ? parsedResult.incorrect_landmarks
-          .map((n: any) => Number(n))
-          .filter((n: number) => Number.isInteger(n) && n >= 0 && n <= 20)
-      : [];
+    const cleanIndices = (v: any) =>
+      Array.isArray(v)
+        ? Array.from(
+            new Set(
+              v.map((n: any) => Number(n)).filter((n: number) => Number.isInteger(n) && n >= 0 && n <= 20)
+            )
+          )
+        : [];
+    parsedResult.incorrect_landmarks = cleanIndices(parsedResult.incorrect_landmarks);
+    parsedResult.incorrect_landmarks_hand2 =
+      handCount > 1 ? cleanIndices(parsedResult.incorrect_landmarks_hand2) : [];
 
     // Return evaluated JSON
     return res.json({
@@ -285,17 +336,23 @@ function pcmToWav(pcm: Buffer, sampleRate = 24000, channels = 1, bitsPerSample =
   return Buffer.concat([header, pcm]);
 }
 
+// Pace applies to every line. Gemini TTS otherwise drifts towards a slow,
+// over-enunciated read; ~140 wpm is normal upbeat conversational speed.
+const TTS_PACE =
+  'Deliver it at a brisk conversational pace — around 140 words per minute, the speed of natural upbeat speech. ' +
+  'Do not slow down or over-enunciate, and do not leave long gaps between sentences.';
+
 // Delivery direction per mascot mood. Gemini TTS is steered with plain
 // language rather than SSML, so these read like notes to a voice actor.
 const TTS_STYLE_DIRECTION: Record<string, string> = {
   CHEERING:
     'Read this like an excited coach who just watched their student nail it. Bright and bubbly, grinning, a little breathless with pride. Push the energy up on the praise and let the last word ring.',
   HAPPY:
-    'Read this warmly and encouragingly, with an audible smile. Relaxed pace, friendly and close-mic, like a favourite teacher leaning in.',
+    'Read this warmly and encouragingly, with an audible smile. Friendly and close-mic, like a favourite teacher leaning in.',
   THINKING:
-    'Read this thoughtfully and a touch slower, like you are studying something closely. Curious, gentle, with a small considering pause before the advice.',
+    'Read this thoughtfully, like you are studying something closely. Curious and gentle, with a small considering beat before the advice.',
   SHOWING_CORRECT_SIGN:
-    'Read this clearly and instructively, like demonstrating a technique. Lean on the action words, leave small beats between the steps so they are easy to follow.',
+    'Read this clearly and instructively, like demonstrating a technique. Lean on the action words, with light beats between the steps so they are easy to follow.',
   CONFUSED:
     'Read this playfully puzzled but kind and reassuring. Soft, slightly amused, with a gentle rising lift at the end so it never sounds like a telling-off.',
 };
@@ -325,7 +382,7 @@ app.post('/api/tts', async (req, res) => {
 
     // Style direction first, then the line itself — the documented steering
     // pattern for the Gemini TTS models.
-    const prompt = `${direction}\nSpeak naturally, like a person talking, not like a screen reader.\n\n${flourish}${text.trim()}`;
+    const prompt = `${direction}\n${TTS_PACE}\nSpeak naturally, like a person talking, not like a screen reader.\n\n${flourish}${text.trim()}`;
 
     const ai = getGeminiClient();
     const response: any = await ai.models.generateContent({

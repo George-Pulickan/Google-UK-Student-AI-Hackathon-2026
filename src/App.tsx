@@ -303,6 +303,7 @@ export default function App() {
           <SignQuizChallenge
             mascotConfig={mascotConfig}
             signSystem={signSystem}
+            voiceEnabled={voiceEnabled}
             onEvaluationComplete={handleEvaluationComplete}
             streakDays={userProgress.streakDays}
             xp={userProgress.xp}

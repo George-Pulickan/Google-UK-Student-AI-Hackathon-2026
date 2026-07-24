@@ -10,6 +10,12 @@ export interface HandLandmark {
   z: number;
 }
 
+/** One detected hand. BSL fingerspelling is two-handed, so frames carry up to two. */
+export interface TrackedHand {
+  landmarks: HandLandmark[];
+  handedness: 'Left' | 'Right' | 'Unknown';
+}
+
 export interface AvatarReaction {
   expression: ExpressionType;
   animation_trigger: AnimationTriggerType;
@@ -23,8 +29,10 @@ export interface SignEvaluationResult {
   detected_gesture?: string;
   misidentified_sign?: string | null;
   positioning_advice?: string;
-  /** Indices (0-20) of hand landmarks Gemini judged to be misplaced. */
+  /** Indices (0-20) of misplaced landmarks on the first detected hand. */
   incorrect_landmarks?: number[];
+  /** Same, for the second hand — used by two-handed BSL signs. */
+  incorrect_landmarks_hand2?: number[];
   target_sign?: string;
   sign_system?: SignLanguageSystem;
   avatar_reaction: AvatarReaction;

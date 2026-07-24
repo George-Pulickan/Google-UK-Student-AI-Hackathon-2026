@@ -447,8 +447,196 @@ export const BSL_SIGNS: SignTarget[] = [
   }
 ];
 
-export const ALL_SIGNS: SignTarget[] = [...ASL_SIGNS, ...BSL_SIGNS];
+/**
+ * Number signs, kept to the counting handshapes that are unambiguous in each
+ * system. There are no chart photos for numbers, so these fall back to the
+ * illustrated diagram — which suits the quiz, where nothing is shown anyway.
+ */
+export const NUMBER_SIGNS: SignTarget[] = [
+  {
+    id: 'NUM_1',
+    label: 'Number 1',
+    system: 'ASL',
+    category: 'Numbers',
+    difficulty: 'Easy',
+    description: 'Index finger points straight up while the other fingers stay curled into the palm.',
+    steps: [
+      'Step 1: Close your hand into a fist with the palm facing forward.',
+      'Step 2: Extend your index finger straight up.',
+      'Step 3: Keep the thumb folded across the curled fingers.',
+    ],
+    keyTips: [
+      'Only the index finger is extended.',
+      'Keep the remaining fingers tightly curled.',
+      'Palm faces away from you.',
+    ],
+    visualHint: '☝️ Index finger straight up, everything else closed.',
+    handShapeDescription: 'Fist with only the index finger extended upward.',
+    handShapeIllustrationType: 'pointing_loop',
+  },
+  {
+    id: 'NUM_2',
+    label: 'Number 2',
+    system: 'ASL',
+    category: 'Numbers',
+    difficulty: 'Easy',
+    description: 'Index and middle fingers extended upward in a V, with the remaining fingers closed.',
+    steps: [
+      'Step 1: Make a fist with your palm facing forward.',
+      'Step 2: Extend the index and middle fingers straight up.',
+      'Step 3: Spread them slightly apart into a clear V.',
+    ],
+    keyTips: [
+      'Two fingers up, separated into a V.',
+      'Ring and pinky stay curled down.',
+      'Thumb rests over the closed fingers.',
+    ],
+    visualHint: '✌️ Index and middle up in a V shape.',
+    handShapeDescription: 'Index and middle fingers extended in a V, other fingers closed.',
+    handShapeIllustrationType: 'v_shape',
+  },
+  {
+    id: 'NUM_3',
+    label: 'Number 3',
+    system: 'ASL',
+    category: 'Numbers',
+    difficulty: 'Medium',
+    description: 'Thumb, index and middle fingers extended, with ring and pinky folded down.',
+    steps: [
+      'Step 1: Extend your thumb out to the side.',
+      'Step 2: Extend the index and middle fingers upward.',
+      'Step 3: Fold the ring and pinky fingers down into the palm.',
+    ],
+    keyTips: [
+      'The thumb counts as one of the three.',
+      'Ring and pinky stay tucked.',
+      'Do not confuse this with the letter W.',
+    ],
+    visualHint: '🤟 Thumb, index and middle extended.',
+    handShapeDescription: 'Thumb, index and middle fingers extended; ring and pinky curled.',
+    handShapeIllustrationType: 'v_shape',
+  },
+  {
+    id: 'NUM_4',
+    label: 'Number 4',
+    system: 'ASL',
+    category: 'Numbers',
+    difficulty: 'Easy',
+    description: 'Four fingers extended and spread with the thumb folded across the palm.',
+    steps: [
+      'Step 1: Open your hand with the palm facing forward.',
+      'Step 2: Extend all four fingers upward, slightly spread.',
+      'Step 3: Fold the thumb across the palm.',
+    ],
+    keyTips: [
+      'All four fingers up, thumb tucked in.',
+      'Keep the fingers slightly apart.',
+      'Palm faces away from you.',
+    ],
+    visualHint: '🖖 Four fingers up, thumb across the palm.',
+    handShapeDescription: 'Four extended fingers with the thumb folded across the palm.',
+    handShapeIllustrationType: 'open_palm_thumb_in',
+  },
+  {
+    id: 'NUM_5',
+    label: 'Number 5',
+    system: 'ASL',
+    category: 'Numbers',
+    difficulty: 'Easy',
+    description: 'All five digits extended and spread wide, palm facing forward.',
+    steps: [
+      'Step 1: Open your hand fully with the palm facing forward.',
+      'Step 2: Extend all four fingers upward.',
+      'Step 3: Extend the thumb out to the side so all five are spread.',
+    ],
+    keyTips: [
+      'All five digits spread apart.',
+      'The thumb is extended, not tucked.',
+      'This is an open hand, held still.',
+    ],
+    visualHint: '🖐️ Open hand, all five digits spread.',
+    handShapeDescription: 'Open hand with all five digits extended and spread.',
+    handShapeIllustrationType: 'open_palm',
+  },
+  {
+    id: 'BSL_NUM_1',
+    label: 'Number 1',
+    system: 'BSL',
+    category: 'Numbers',
+    difficulty: 'Easy',
+    description: 'Index finger extended upward from a closed fist.',
+    steps: [
+      'Step 1: Close your hand into a fist.',
+      'Step 2: Extend the index finger straight up.',
+      'Step 3: Hold it steady in front of you.',
+    ],
+    keyTips: ['Index finger only.', 'Other fingers curled.', 'Hand held at chest height.'],
+    visualHint: '☝️ One finger raised.',
+    handShapeDescription: 'Fist with the index finger extended upward.',
+    handShapeIllustrationType: 'pointing_loop',
+  },
+  {
+    id: 'BSL_NUM_2',
+    label: 'Number 2',
+    system: 'BSL',
+    category: 'Numbers',
+    difficulty: 'Easy',
+    description: 'Index and middle fingers extended upward from a closed fist.',
+    steps: [
+      'Step 1: Close your hand into a fist.',
+      'Step 2: Extend the index and middle fingers upward.',
+      'Step 3: Keep the ring and pinky curled.',
+    ],
+    keyTips: ['Two fingers raised.', 'Ring and pinky stay down.', 'Palm faces forward.'],
+    visualHint: '✌️ Two fingers raised.',
+    handShapeDescription: 'Index and middle fingers extended, other fingers curled.',
+    handShapeIllustrationType: 'v_shape',
+  },
+  {
+    id: 'BSL_NUM_3',
+    label: 'Number 3',
+    system: 'BSL',
+    category: 'Numbers',
+    difficulty: 'Medium',
+    description: 'Index, middle and ring fingers extended upward.',
+    steps: [
+      'Step 1: Close your hand into a fist.',
+      'Step 2: Extend the index, middle and ring fingers upward.',
+      'Step 3: Keep the thumb and pinky closed.',
+    ],
+    keyTips: ['Three fingers raised.', 'Pinky stays curled.', 'Fingers slightly apart.'],
+    visualHint: '🖖 Three fingers raised.',
+    handShapeDescription: 'Index, middle and ring fingers extended upward.',
+    handShapeIllustrationType: 'open_palm',
+  },
+  {
+    id: 'BSL_NUM_5',
+    label: 'Number 5',
+    system: 'BSL',
+    category: 'Numbers',
+    difficulty: 'Easy',
+    description: 'All five digits extended and spread, palm facing forward.',
+    steps: [
+      'Step 1: Open your hand fully.',
+      'Step 2: Extend all four fingers upward.',
+      'Step 3: Extend the thumb out so all five are spread.',
+    ],
+    keyTips: ['All five digits spread.', 'Thumb extended, not tucked.', 'Open, still hand.'],
+    visualHint: '🖐️ Open hand, five digits spread.',
+    handShapeDescription: 'Open hand with all five digits extended and spread.',
+    handShapeIllustrationType: 'open_palm',
+  },
+];
+
+export const ALL_SIGNS: SignTarget[] = [...ASL_SIGNS, ...BSL_SIGNS, ...NUMBER_SIGNS];
 
 export function getSignTargets(system: SignLanguageSystem): SignTarget[] {
   return ALL_SIGNS.filter((sign) => sign.system === system);
+}
+
+/** Alphabet and number signs only — the pool the quiz draws from. */
+export function getQuizPool(system: SignLanguageSystem): SignTarget[] {
+  return getSignTargets(system).filter(
+    (sign) => sign.category === 'Alphabet' || sign.category === 'Numbers'
+  );
 }
