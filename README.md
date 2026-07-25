@@ -10,8 +10,7 @@
 
 An interactive, AI-powered sign language tutor. SignBuddy watches you fingerspell
 in British (BSL) or American (ASL) Sign Language through your webcam, tracks your
-hands live, and tells you **exactly which joints are wrong** — it doesn't score
-you, it corrects you.
+hands live, and tells you **exactly which joints are wrong**.
 
 ## What it does
 
